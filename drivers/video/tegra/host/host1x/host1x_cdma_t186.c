@@ -29,6 +29,7 @@
 #include "chip_support.h"
 #include "nvhost_job.h"
 #include "nvhost_vm.h"
+#include "platform.h"
 
 static inline u32 host1x_channel_dmactrl(int stop, int get_rst, int init_get)
 {
@@ -394,9 +395,6 @@ static void cdma_timeout_release_mlock(struct nvhost_cdma *cdma)
 	struct nvhost_job *job = NULL;
 	struct nvhost_channel *ch;
 	dma_addr_t dma_handle = 0;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 9, 0)
-	DEFINE_DMA_ATTRS(attrs);
-#endif
 	u32 *cpuvaddr = NULL;
 	bool ch_own, cpu_own;
 	unsigned int owner;
@@ -407,14 +405,15 @@ static void cdma_timeout_release_mlock(struct nvhost_cdma *cdma)
 	if (pdata->resource_policy == RESOURCE_PER_DEVICE)
 		return;
 
-	/* read the owner */
-	syncpt_op().mutex_owner(syncpt, pdata->modulemutexes[0],
-				&cpu_own, &ch_own, &owner);
+	if (nvhost_dev_is_virtual(pdev) == false) {
+		/* read the owner */
+		syncpt_op().mutex_owner(syncpt, pdata->modulemutexes[0],
+					&cpu_own, &ch_own, &owner);
 
-	/* if this channel does not own the mlock, quit */
-	if (!(ch_own && owner == orig_ch->chid) &&
-	    !dev->info.vmserver_owns_engines)
-		return;
+		/* if this channel does not own the mlock, quit */
+		if (!(ch_own && owner == orig_ch->chid))
+			return;
+	}
 
 	/* allocate a new channel to execute recovery. use a stack variable
 	 * as an identifier to ensure that no-one else can get the same
@@ -432,14 +431,8 @@ static void cdma_timeout_release_mlock(struct nvhost_cdma *cdma)
 	nvhost_channel_remove_identifier(pdata, &ch);
 
 	/* allocate a command buffer */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 9, 0)
-	cpuvaddr = dma_alloc_attrs(pdev->dev.parent, SZ_4K,
-				   &dma_handle, GFP_KERNEL,
-				   &attrs);
-#else
 	cpuvaddr = dma_alloc_attrs(pdev->dev.parent, SZ_4K,
 				   &dma_handle, GFP_KERNEL, 0);
-#endif
 	if (!cpuvaddr) {
 		nvhost_err(&pdev->dev, "mlock release failed: failed to allocate release buffer\n");
 		goto err_alloc_buffer;
@@ -483,26 +476,28 @@ static void cdma_timeout_release_mlock(struct nvhost_cdma *cdma)
 		goto err_submit;
 	}
 
-	/* WAR to Host1x MLOCK mechanism. Re-acquiring MLOCK for the
-	 * same channel may not succeed automatically but we need to
-	 * assign the MLOCK using register write */
+	if (nvhost_dev_is_virtual(pdev) == false) {
+		/* WAR to Host1x MLOCK mechanism. Re-acquiring MLOCK for the
+		 * same channel may not succeed automatically but we need to
+		 * assign the MLOCK using register write */
+		while (true) {
+			/* Wait a moment */
+			mdelay(10);
 
-	while (true) {
-		/* Wait a moment */
-		mdelay(10);
+			/* If MLOCK is no longer assigned for this channel, quit */
+			syncpt_op().mutex_owner(syncpt, pdata->modulemutexes[0],
+						&cpu_own, &ch_own, &owner);
+			if (!ch_own ||
+			    (owner != orig_ch->chid && owner != ch->chid))
+				break;
 
-		/* If MLOCK is no longer assigned for this channel, quit */
-		syncpt_op().mutex_owner(syncpt, pdata->modulemutexes[0],
-					&cpu_own, &ch_own, &owner);
-		if (!ch_own || (owner != orig_ch->chid && owner != ch->chid))
-			break;
-
-		/* ..otherwise, reassign MLOCK for this channel */
-		host1x_hypervisor_writel(dev->dev,
-				 host1x_sync_common_mlock_r() +
-				 pdata->modulemutexes[0] * 4,
-				 host1x_sync_common_mlock_ch_f(ch->chid) |
-				 host1x_sync_common_mlock_locked_f(true));
+			/* ..otherwise, reassign MLOCK for this channel */
+			host1x_hypervisor_writel(dev->dev,
+					 host1x_sync_common_mlock_r() +
+					 pdata->modulemutexes[0] * 4,
+					 host1x_sync_common_mlock_ch_f(ch->chid) |
+					 host1x_sync_common_mlock_locked_f(true));
+		}
 	}
 
 	/* Wait until the MLOCK is released */
@@ -514,11 +509,7 @@ err_add_gather:
 err_job_alloc:
 	nvhost_syncpt_put_ref(syncpt, syncpt_id);
 err_alloc_syncpt:
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 9, 0)
-	dma_free_attrs(pdev->dev.parent, SZ_4K, cpuvaddr, dma_handle, &attrs);
-#else
 	dma_free_attrs(pdev->dev.parent, SZ_4K, cpuvaddr, dma_handle, 0);
-#endif
 err_alloc_buffer:
 	nvhost_putchannel(ch, 1);
 }

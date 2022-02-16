@@ -578,6 +578,7 @@ const char *const _regd_str[] = {
 	"WW",
 };
 
+#if CONFIG_TXPWR_LIMIT
 void _dump_regd_exc_list(void *sel, struct rf_ctl_t *rfctl)
 {
 	struct regd_exc_ent *ent;
@@ -1185,6 +1186,7 @@ void rtw_txpwr_lmt_list_free(struct rf_ctl_t *rfctl)
 
 	_exit_critical_mutex(&rfctl->txpwr_lmt_mutex, &irqL);
 }
+#endif /* CONFIG_TXPWR_LIMIT */
 
 int rtw_ch_to_bb_gain_sel(int ch)
 {

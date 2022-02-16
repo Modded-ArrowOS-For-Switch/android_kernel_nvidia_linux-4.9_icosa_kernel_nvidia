@@ -3,7 +3,7 @@
  *
  * A header file containing shared data structures shared with ADSP OS
  *
- * Copyright (C) 2015-2018 NVIDIA Corporation. All rights reserved.
+ * Copyright (C) 2015-2021 NVIDIA Corporation. All rights reserved.
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and

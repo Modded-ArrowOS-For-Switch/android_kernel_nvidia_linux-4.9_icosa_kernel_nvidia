@@ -63,7 +63,7 @@ retry:
 			err = vpr_user_module[i].do_idle(
 					vpr_user_module[i].data);
 			if (err) {
-				pr_err("%s:%d: %pF failed err:%d\n",
+				pr_err("%s:%d: %pxF failed err:%d\n",
 					 __func__, __LINE__,
 					vpr_user_module[i].do_idle, err);
 				break;
@@ -74,7 +74,7 @@ retry:
 		/* Config VPR_BOM/_SIZE in MC */
 		err = _tegra_set_vpr_params((void *)(uintptr_t)base, size);
 		if (err)
-			pr_err("vpr resize to (%p, %zu) failed. err=%d\n",
+			pr_err("vpr resize to (%px, %zu) failed. err=%d\n",
 				(void *)(uintptr_t)base, size, err);
 		else
 			retries = 0; /* finish */
@@ -93,7 +93,7 @@ retry:
 				vpr_user_module[i].data);
 		if (!err)
 			continue;
-		pr_err("%s:%d: %pF failed err:%d. Could be fatal!!\n",
+		pr_err("%s:%d: %pxF failed err:%d. Could be fatal!!\n",
 			 __func__, __LINE__,
 			vpr_user_module[i].do_unidle, err);
 		/* vpr resize is success, so return 0 on unidle failure */
@@ -108,11 +108,11 @@ struct dma_resize_notifier_ops vpr_dev_ops = {
 };
 EXPORT_SYMBOL(vpr_dev_ops);
 
-bool tegra_is_vpr_resize_supported(void)
+bool tegra_is_vpr_resize_enabled(void)
 {
 	return tegra_vpr_resize;
 }
-EXPORT_SYMBOL(tegra_is_vpr_resize_supported);
+EXPORT_SYMBOL(tegra_is_vpr_resize_enabled);
 
 /* SMC Definitions*/
 #define TE_SMC_PROGRAM_VPR 0x82000003
@@ -127,7 +127,7 @@ static int _tegra_set_vpr_params(void *vpr_base, size_t vpr_size)
 				(uintptr_t)vpr_base, vpr_size);
 
 	if (retval != 0) {
-		pr_err("%s: smc failed, base 0x%p size %zx, err (0x%x)\n",
+		pr_err("%s: smc failed, base 0x%px size %zx, err (0x%x)\n",
 			__func__, vpr_base, vpr_size, retval);
 		return -EINVAL;
 	}
@@ -173,7 +173,7 @@ unlock:
 	if (i != NUM_MODULES_IDLE_VPR_RESIZE)
 		return;
 
-	pr_err("%pF,%pF failed to register to be called before vpr resize!!\n",
+	pr_err("%pxF,%pxF failed to register to be called before vpr resize!!\n",
 		do_idle, do_unidle);
 }
 EXPORT_SYMBOL(tegra_register_idle_unidle);

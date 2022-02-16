@@ -1,7 +1,7 @@
 /*
  * NVIDIA Tegra CSI Device Header
  *
- * Copyright (c) 2015-2019, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2015-2021, NVIDIA CORPORATION.  All rights reserved.
  *
  * Author: Bryan Wu <pengw@nvidia.com>
  *
@@ -86,6 +86,10 @@ struct tegra_csi_device {
 	const struct tegra_csi_fops *fops;
 	const struct tpg_frmfmt *tpg_frmfmt_table;
 	unsigned int tpg_frmfmt_table_size;
+	bool tpg_gain_ctrl;
+	bool tpg_emb_data_config;
+	int (*get_tpg_settings)(struct tegra_csi_port *port,
+			union nvcsi_tpg_config *const tpg_config);
 	atomic_t power_ref;
 
 	struct dentry *debugdir;
@@ -136,7 +140,6 @@ static inline struct tegra_csi_device *to_csi(struct v4l2_subdev *subdev)
 
 u32 read_phy_mode_from_dt(struct tegra_csi_channel *chan);
 u32 read_settle_time_from_dt(struct tegra_csi_channel *chan);
-u32 read_discontinuous_clk_from_dt(struct tegra_csi_channel *chan);
 u64 read_pixel_clk_from_dt(struct tegra_csi_channel *chan);
 void set_csi_portinfo(struct tegra_csi_device *csi,
 	unsigned int port, unsigned int numlanes);
@@ -144,6 +147,7 @@ void tegra_csi_status(struct tegra_csi_channel *chan, int port_idx);
 int tegra_csi_error(struct tegra_csi_channel *chan, int port_idx);
 int tegra_csi_start_streaming(struct tegra_csi_channel *chan, int port_idx);
 void tegra_csi_stop_streaming(struct tegra_csi_channel *chan, int port_idx);
+int tegra_csi_tpg_set_gain(struct v4l2_subdev *sd, void *arg);
 void tegra_csi_error_recover(struct tegra_csi_channel *chan, int port_idx);
 int tegra_csi_init(struct tegra_csi_device *csi,
 		struct platform_device *pdev);

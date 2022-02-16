@@ -33,11 +33,9 @@
 static struct actmon_drv_data *actmon;
 static struct device *mon_dev;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 0)
 #include <linux/platform/tegra/emc_bwmgr.h>
 static u8 max_dram_channels;
 static u8 ch_num;
-#endif
 
 #define offs(dev_reg_offs) (actmon->base + dev_reg_offs)
 
@@ -237,21 +235,6 @@ static const struct file_operations type_fops = {
 	.release	= single_release,
 };
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 9, 0)
-static int actv_get(void *data, u64 *val)
-{
-	struct actmon_dev *dev = data;
-	unsigned long flags;
-
-	spin_lock_irqsave(&dev->lock, flags);
-	*val = actmon_dev_avg_freq_get(dev);
-	spin_unlock_irqrestore(&dev->lock, flags);
-	return 0;
-}
-DEFINE_SIMPLE_ATTRIBUTE(actv_fops, actv_get, NULL,
-	"%llu\n");
-#endif
-
 static int step_get(void *data, u64 *val)
 {
 	struct actmon_dev *dev = data;
@@ -375,6 +358,9 @@ static int period_set(void *data, u64 val)
 		for (i = 0; i < MAX_DEVICES; i++) {
 			struct actmon_dev *dev = &actmon->devices[i];
 
+			if (!dev->dn)
+				continue;
+
 			spin_lock_irqsave(&dev->lock, flags);
 			actmon_dev_wmark_set(dev);
 			spin_unlock_irqrestore(&dev->lock, flags);
@@ -461,18 +447,12 @@ static int actmon_debugfs_create_dev(struct actmon_dev *dev)
 	if (!d)
 		return -ENOMEM;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 9, 0)
-	d = debugfs_create_file(
-		"avg_activity", RO_MODE, dir, dev, &actv_fops);
-	if (!d)
-		return -ENOMEM;
-#endif
-
 	d = debugfs_create_file(
 		"boost_step", RW_MODE, dir, dev, &step_fops);
 	if (!d)
 		return -ENOMEM;
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
 	d = debugfs_create_u32(
 		"boost_rate_dec", RW_MODE, dir, (u32 *)&dev->boost_down_coef);
 	if (!d)
@@ -482,7 +462,13 @@ static int actmon_debugfs_create_dev(struct actmon_dev *dev)
 		"boost_rate_inc", RW_MODE, dir, (u32 *)&dev->boost_up_coef);
 	if (!d)
 		return -ENOMEM;
+#else
+	debugfs_create_u32(
+		"boost_rate_dec", RW_MODE, dir, (u32 *)&dev->boost_down_coef);
 
+	debugfs_create_u32(
+		"boost_rate_inc", RW_MODE, dir, (u32 *)&dev->boost_up_coef);
+#endif
 	d = debugfs_create_file(
 		"boost_threshold_dn", RW_MODE, dir, dev, &down_threshold_fops);
 	if (!d)
@@ -527,9 +513,11 @@ static int __init actmon_debugfs_init(void)
 		goto err_out;
 
 	for (i = 0; i < MAX_DEVICES; i++) {
-		ret = actmon_debugfs_create_dev(&actmon->devices[i]);
-		if (ret)
-			goto err_out;
+		if (actmon->devices[i].dn) {
+			ret = actmon_debugfs_create_dev(&actmon->devices[i]);
+			if (ret)
+				goto err_out;
+		}
 	}
 	return 0;
 
@@ -859,7 +847,6 @@ static int actmon_dev_parse_dt(struct actmon_dev *dev,
 			dev->dn->name, dev->count_weight);
 	}
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 0)
 	ret = of_property_read_u8(dev->dn, "nvidia,max_dram_channels",
 			&max_dram_channels);
 	if (ret) {
@@ -868,7 +855,6 @@ static int actmon_dev_parse_dt(struct actmon_dev *dev,
 	ch_num = tegra_bwmgr_get_dram_num_channels();
 	if (ch_num && max_dram_channels)
 		dev->count_weight *= (u32)(max_dram_channels / ch_num);
-#endif
 
 	ret = of_property_read_u32(dev->dn, "nvidia,type",
 			&dev->type);
@@ -922,7 +908,8 @@ static int actmon_dev_init(struct actmon_dev *dev,
 
 	ret = devm_request_threaded_irq(&pdev->dev,
 			actmon->virq, actmon_dev_isr, actmon_dev_fn,
-			IRQ_TYPE_LEVEL_HIGH, dev_name(&pdev->dev), dev);
+			IRQ_TYPE_LEVEL_HIGH | IRQF_SHARED,
+			dev_name(&pdev->dev), dev);
 	if (ret) {
 		dev_err(mon_dev, "Failed irq %d request for.%s\n",
 		actmon->virq, dev_name(&pdev->dev));
@@ -1084,6 +1071,7 @@ int tegra_actmon_register(struct actmon_drv_data *actmon_data)
 		if (ret)
 			dev_err(mon_dev, "Couldn't create avg_actv files\n");
 	}
+
 #ifdef CONFIG_DEBUG_FS
 	ret = actmon_debugfs_init();
 #endif

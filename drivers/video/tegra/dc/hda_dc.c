@@ -30,12 +30,33 @@
 #include "hdmi2.0.h"
 #include "dp.h"
 #include "hda_dc.h"
+#include <sound/hda_verbs.h>
 
 static struct tegra_hda_inst *hda_inst;
 static DEFINE_MUTEX(global_hda_lock);
 
 #define to_hdmi(DATA)	((struct tegra_hdmi *)DATA)
 #define to_dp(DATA)	((struct tegra_dc_dp_data *)DATA)
+
+void tegra_hda_parse_format(unsigned int format, unsigned int *rate,
+			   unsigned int *channels, unsigned int *is_pcm_format)
+{
+	unsigned int mul, div;
+
+	if (format & AC_FMT_BASE_44K)
+		*rate = 44100;
+	else
+		*rate = 48000;
+
+	mul = (format & AC_FMT_MULT_MASK) >> AC_FMT_MULT_SHIFT;
+	div = (format & AC_FMT_DIV_MASK) >> AC_FMT_DIV_SHIFT;
+
+	*rate = *rate * (mul + 1) / (div + 1);
+
+	*channels = ((format & AC_FMT_CHAN_MASK) >> AC_FMT_CHAN_SHIFT) + 1;
+	*is_pcm_format = ((format &
+			(1 << AC_FMT_TYPE_SHIFT)) == (AC_FMT_TYPE_PCM));
+}
 
 int tegra_hda_get_dev_id(struct tegra_dc_sor_data *sor)
 {
@@ -44,7 +65,7 @@ int tegra_hda_get_dev_id(struct tegra_dc_sor_data *sor)
 	if (!sor)
 		return -ENODEV;
 
-	tegra_unpowergate_partition(sor->powergate_id);
+	tegra_sor_unpowergate(sor);
 	tegra_sor_safe_clk_enable(sor);
 	if (!sor->dc->initialized)
 		tegra_sor_clk_enable(sor);
@@ -56,7 +77,7 @@ int tegra_hda_get_dev_id(struct tegra_dc_sor_data *sor)
 	if (!sor->dc->initialized)
 		tegra_sor_clk_disable(sor);
 	tegra_sor_safe_clk_disable(sor);
-	tegra_powergate_partition(sor->powergate_id);
+	tegra_sor_powergate(sor);
 	return dev_id;
 }
 EXPORT_SYMBOL(tegra_hda_get_dev_id);
@@ -221,7 +242,7 @@ int tegra_hdmi_setup_hda_presence(int dev_id)
 		goto err;
 
 	if (*(hda->enabled) && *(hda->eld_valid)) {
-		tegra_unpowergate_partition(hda->sor->powergate_id);
+		tegra_sor_unpowergate(hda->sor);
 		tegra_sor_safe_clk_enable(hda->sor);
 		tegra_sor_clk_enable(hda->sor);
 		tegra_dc_io_start(hda->dc);
@@ -237,7 +258,7 @@ int tegra_hdmi_setup_hda_presence(int dev_id)
 		tegra_dc_io_end(hda->dc);
 		tegra_sor_clk_disable(hda->sor);
 		tegra_sor_safe_clk_disable(hda->sor);
-		tegra_powergate_partition(hda->sor->powergate_id);
+		tegra_sor_powergate(hda->sor);
 		val = 0;
 	}
 
@@ -420,7 +441,7 @@ int tegra_hdmi_setup_audio_freq_source(unsigned audio_freq,
 		goto err;
 
 	if (valid_freq) {
-		tegra_unpowergate_partition(hda->sor->powergate_id);
+		tegra_sor_unpowergate(hda->sor);
 		tegra_sor_clk_enable(hda->sor);
 		tegra_dc_io_start(hda->dc);
 
@@ -428,7 +449,7 @@ int tegra_hdmi_setup_audio_freq_source(unsigned audio_freq,
 
 		tegra_dc_io_end(hda->dc);
 		tegra_sor_clk_disable(hda->sor);
-		tegra_powergate_partition(hda->sor->powergate_id);
+		tegra_sor_powergate(hda->sor);
 		val = 0;
 	}
 err:
@@ -461,7 +482,7 @@ int tegra_hdmi_audio_null_sample_inject(bool on, int dev_id)
 	if (hda_inst[sor_num].hda_state != HDA_ENABLED)
 		goto err;
 
-	tegra_unpowergate_partition(hda->sor->powergate_id);
+	tegra_sor_unpowergate(hda->sor);
 	tegra_sor_clk_enable(hda->sor);
 	tegra_dc_io_start(hda->dc);
 
@@ -479,7 +500,7 @@ int tegra_hdmi_audio_null_sample_inject(bool on, int dev_id)
 	null_sample_flag = on;
 	tegra_dc_io_end(hda->dc);
 	tegra_sor_clk_disable(hda->sor);
-	tegra_powergate_partition(hda->sor->powergate_id);
+	tegra_sor_powergate(hda->sor);
 err:
 	hda->null_sample_inject = null_sample_flag;
 	mutex_unlock(&hda_inst[sor_num].hda_inst_lock);
@@ -639,7 +660,7 @@ void tegra_hda_disable(void *hda_handle)
 void tegra_hda_init(struct tegra_dc *dc, void *data)
 {
 	int i, size;
-	struct tegra_dc_hda_data *hda = NULL;
+	struct tegra_dc_hda_data *hda;
 
 	mutex_lock(&global_hda_lock);
 	if (!hda_inst) {
@@ -717,12 +738,6 @@ void tegra_hda_init(struct tegra_dc *dc, void *data)
 	}
 	return;
 err:
-	if (hda) {
-		if (hda->audio_switch_name)
-			/* this should not happen, but left for future */
-			kfree(hda->audio_switch_name);
-		kfree(hda);
-	}
 	dev_err(&dc->ndev->dev,
 		"Failed to allocate hda handle memory");
 }

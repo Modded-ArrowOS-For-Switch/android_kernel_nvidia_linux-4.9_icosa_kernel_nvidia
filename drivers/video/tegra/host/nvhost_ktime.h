@@ -21,6 +21,8 @@
 #ifndef __NVHOST_KTIME_H
 #define __NVHOST_KTIME_H
 
+#include <linux/version.h>
+
 enum nvhost_clock_id {
 	NVHOST_CLOCK_UNKNOWN = 0,
 	NVHOST_CLOCK_MONOTONIC,
@@ -28,7 +30,7 @@ enum nvhost_clock_id {
 };
 
 struct nvhost_timespec {
-	struct timespec ts;
+	struct timespec64 ts;
 	enum nvhost_clock_id clock;
 };
 
@@ -40,10 +42,10 @@ do {					\
 	u64 time_ns;			\
 	int err = get_ptp_hwtime(&time_ns);		\
 	if (err) {					\
-		ktime_get_ts(&(nvts)->ts);			\
+		ktime_get_ts64(&(nvts)->ts);			\
 		(nvts)->clock = NVHOST_CLOCK_MONOTONIC;	\
 	} else {						\
-		(nvts)->ts = ns_to_timespec(time_ns);		\
+		(nvts)->ts = ns_to_timespec64(time_ns);		\
 		(nvts)->clock = NVHOST_CLOCK_PTP;		\
 	}							\
 } while (0)
@@ -53,7 +55,7 @@ do {					\
 
 #define nvhost_ktime_get_ts(nvts)	\
 do {					\
-	ktime_get_ts(&(nvts)->ts);			\
+	ktime_get_ts64(&(nvts)->ts);			\
 	(nvts)->clock = NVHOST_CLOCK_MONOTONIC;	\
 } while (0)
 

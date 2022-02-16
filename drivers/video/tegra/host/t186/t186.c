@@ -1,7 +1,7 @@
 /*
  * Tegra Graphics Init for T186 Architecture Chips
  *
- * Copyright (c) 2014-2019, NVIDIA Corporation. All rights reserved.
+ * Copyright (c) 2014-2020, NVIDIA Corporation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -18,11 +18,8 @@
 
 #include <linux/slab.h>
 #include <linux/io.h>
-#include <soc/tegra/chip-id.h>
+#include <linux/version.h>
 #include <linux/platform/tegra/emc_bwmgr.h>
-
-#include <soc/tegra/kfuse.h>
-#include <linux/platform/tegra/mc.h>
 
 #include "dev.h"
 #include "class_ids.h"
@@ -34,7 +31,7 @@
 #include "flcn/flcn.h"
 #include "isp/isp.h"
 #include "isp/isp_isr_v2.h"
-#if defined(CONFIG_TEGRA_GRHOST_NVCSI)
+#if IS_ENABLED(CONFIG_TEGRA_GRHOST_NVCSI)
 #include "nvcsi/nvcsi.h"
 #endif
 #include <video/vi4.h>
@@ -53,64 +50,6 @@
 #define HOST_EMC_FLOOR 204000000
 #define HOST_NVDEC_EMC_FLOOR 102000000
 
-/*
- * TODO: Move following functions to the corresponding files under
- * kernel-3.18 once kernel-t18x gets merged there. Until that
- * happens we can keep these here to avoid extensive amount of
- * added infra
- */
-
-static inline u32 flcn_thi_sec(void)
-{
-	return 0x00000038;
-}
-
-static inline u32 flcn_thi_sec_ch_lock(void)
-{
-	return (1 << 8);
-}
-
-#if defined(CONFIG_TEGRA_GRHOST_TSEC)
-static int nvhost_tsec_t186_finalize_poweron(struct platform_device *dev)
-{
-	/* Disable access to non-THI registers through channel */
-	host1x_writel(dev, flcn_thi_sec(), flcn_thi_sec_ch_lock());
-
-	return nvhost_tsec_finalize_poweron(dev);
-}
-#endif
-
-#if defined(CONFIG_TEGRA_GRHOST_NVENC) || defined(CONFIG_TEGRA_GRHOST_NVJPG) \
-	    || defined(CONFIG_TEGRA_GRHOST_VIC)
-static int nvhost_flcn_t186_finalize_poweron(struct platform_device *dev)
-{
-	/* Disable access to non-THI registers through channel */
-	host1x_writel(dev, flcn_thi_sec(), flcn_thi_sec_ch_lock());
-
-	return nvhost_flcn_finalize_poweron(dev);
-}
-#endif
-
-#if defined(CONFIG_TEGRA_GRHOST_NVDEC)
-static int nvhost_nvdec_t186_finalize_poweron(struct platform_device *dev)
-{
-	int ret;
-
-	ret = tegra_kfuse_enable_sensing();
-	if (ret)
-		return ret;
-
-	/* Disable access to non-THI registers through channel */
-	host1x_writel(dev, flcn_thi_sec(), flcn_thi_sec_ch_lock());
-
-	ret = nvhost_nvdec_finalize_poweron(dev);
-
-	tegra_kfuse_disable_sensing();
-
-	return ret;
-}
-#endif
-
 static struct host1x_device_info host1x04_info = {
 	.nb_channels	= T186_NVHOST_NUMCHANNELS,
 	.ch_base	= 0,
@@ -121,11 +60,10 @@ static struct host1x_device_info host1x04_info = {
 	.nb_pts		= NV_HOST1X_SYNCPT_NB_PTS,
 	.pts_base	= 0,
 	.pts_limit	= NV_HOST1X_SYNCPT_NB_PTS,
+	.nb_syncpt_irqs	= 1,
 	.syncpt_policy	= SYNCPT_PER_CHANNEL_INSTANCE,
 	.channel_policy	= MAP_CHANNEL_ON_SUBMIT,
-	.firmware_area_size = SZ_1M,
 	.nb_actmons = 1,
-	.dma_mask	= DMA_BIT_MASK(40),
 };
 
 struct nvhost_device_data t18_host1x_info = {
@@ -163,10 +101,10 @@ static struct host1x_device_info host1xb04_info = {
 	.nb_pts		= NV_HOST1X_SYNCPT_NB_PTS,
 	.pts_base	= 0,
 	.pts_limit	= NV_HOST1X_SYNCPT_NB_PTS,
+	.nb_syncpt_irqs	= 1,
 	.syncpt_policy	= SYNCPT_PER_CHANNEL_INSTANCE,
 	.channel_policy	= MAP_CHANNEL_ON_SUBMIT,
-	.firmware_area_size = SZ_1M,
-	.dma_mask	= DMA_BIT_MASK(40),
+	.ctrl_name	= "ctrlb",
 };
 
 struct nvhost_device_data t18_host1xb_info = {
@@ -192,8 +130,8 @@ struct nvhost_device_data t18_isp_info = {
 	.clocks			= {
 		{"isp", 768000000},
 	},
-	.finalize_poweron	= nvhost_isp_t210_finalize_poweron,
-	.prepare_poweroff	= nvhost_isp_t124_prepare_poweroff,
+	.finalize_poweron	= nvhost_isp_finalize_poweron,
+	.prepare_poweroff	= nvhost_isp_prepare_poweroff,
 	.hw_init		= nvhost_isp_register_isr_v2,
 	.ctrl_ops		= &tegra_isp_ctrl_ops,
 	.resource_policy	= RESOURCE_PER_CHANNEL_INSTANCE,
@@ -204,7 +142,7 @@ struct nvhost_device_data t18_isp_info = {
 };
 #endif
 
-#if defined(CONFIG_VIDEO_TEGRA_VI) || defined(CONFIG_VIDEO_TEGRA_VI_MODULE)
+#if IS_ENABLED(CONFIG_VIDEO_TEGRA_VI) || IS_ENABLED(CONFIG_VIDEO_TEGRA_VI_MODULE)
 struct nvhost_device_data t18_vi_info = {
 	.devfs_name		= "vi",
 	.exclusive		= true,
@@ -219,8 +157,8 @@ struct nvhost_device_data t18_vi_info = {
 	.moduleid		= NVHOST_MODULE_VI,
 	.clocks = {
 		{"vi", 408000000},
-		{"nvcsi", 204000000, 0, 0, 0, true},
-		{"nvcsilp", 204000000, 0, 0, 0, true},
+		{"nvcsi", 204000000, 0, 0, true},
+		{"nvcsilp", 204000000, 0, 0, true},
 	},
 	.num_channels		= 15,
 	.prepare_poweroff	= nvhost_vi4_prepare_poweroff,
@@ -242,11 +180,10 @@ struct nvhost_device_data t18_vi_info = {
 				   {0x30000 * 4, true} },
 	.num_ppc			= 8,
 	.aggregate_constraints	= nvhost_vi4_aggregate_constraints,
-	.no_platform_dma_mask	= true,
 };
 #endif
 
-#if defined(CONFIG_TEGRA_GRHOST_NVENC)
+#if IS_ENABLED(CONFIG_TEGRA_GRHOST_NVENC)
 struct nvhost_device_data t18_msenc_info = {
 	.version		= NVHOST_ENCODE_FLCN_VER(6, 1),
 	.devfs_name		= "msenc",
@@ -255,15 +192,15 @@ struct nvhost_device_data t18_msenc_info = {
 	.can_powergate          = true,
 	.autosuspend_delay      = 500,
 	.clocks			= {
-		{"nvenc", UINT_MAX, 0, TEGRA_MC_CLIENT_MSENC},
+		{"nvenc", UINT_MAX, 0},
 		{"emc", HOST_EMC_FLOOR,
 		 NVHOST_MODULE_ID_EXTERNAL_MEMORY_CONTROLLER,
-		 0, TEGRA_BWMGR_SET_EMC_SHARED_BW}
+		 TEGRA_SET_EMC_SHARED_BW}
 	},
 	.engine_cg_regs		= t18x_nvenc_gating_registers,
 	.engine_can_cg		= true,
 	.poweron_reset		= true,
-	.finalize_poweron	= nvhost_flcn_t186_finalize_poweron,
+	.finalize_poweron	= nvhost_flcn_finalize_poweron_t186,
 	.moduleid		= NVHOST_MODULE_MSENC,
 	.num_channels		= 1,
 	.firmware_name		= "nvhost_nvenc061.fw",
@@ -279,7 +216,7 @@ struct nvhost_device_data t18_msenc_info = {
 };
 #endif
 
-#if defined(CONFIG_TEGRA_GRHOST_NVDEC)
+#if IS_ENABLED(CONFIG_TEGRA_GRHOST_NVDEC)
 struct nvhost_device_data t18_nvdec_info = {
 	.version		= NVHOST_ENCODE_NVDEC_VER(3, 0),
 	.devfs_name		= "nvdec",
@@ -288,15 +225,16 @@ struct nvhost_device_data t18_nvdec_info = {
 	.can_powergate          = true,
 	.autosuspend_delay      = 500,
 	.clocks			= {
-		{"nvdec", UINT_MAX, 0, TEGRA_MC_CLIENT_NVDEC},
+		{"nvdec", UINT_MAX, 0},
 		{"emc", HOST_NVDEC_EMC_FLOOR,
 		 NVHOST_MODULE_ID_EXTERNAL_MEMORY_CONTROLLER,
-		 0, TEGRA_BWMGR_SET_EMC_FLOOR}
+		 TEGRA_SET_EMC_FLOOR}
 	},
 	.engine_cg_regs		= t18x_nvdec_gating_registers,
 	.engine_can_cg		= true,
 	.poweron_reset		= true,
-	.finalize_poweron	= nvhost_nvdec_t186_finalize_poweron,
+	.finalize_poweron	= nvhost_nvdec_finalize_poweron_t186,
+	.prepare_poweroff	= nvhost_nvdec_prepare_poweroff_t186,
 	.moduleid		= NVHOST_MODULE_NVDEC,
 	.ctrl_ops		= &tegra_nvdec_ctrl_ops,
 	.num_channels		= 1,
@@ -312,7 +250,7 @@ struct nvhost_device_data t18_nvdec_info = {
 };
 #endif
 
-#if defined(CONFIG_TEGRA_GRHOST_NVJPG)
+#if IS_ENABLED(CONFIG_TEGRA_GRHOST_NVJPG)
 struct nvhost_device_data t18_nvjpg_info = {
 	.version		= NVHOST_ENCODE_FLCN_VER(1, 1),
 	.devfs_name		= "nvjpg",
@@ -321,15 +259,15 @@ struct nvhost_device_data t18_nvjpg_info = {
 	.can_powergate          = true,
 	.autosuspend_delay      = 500,
 	.clocks			= {
-		{"nvjpg", UINT_MAX, 0, TEGRA_MC_CLIENT_NVJPG},
+		{"nvjpg", UINT_MAX, 0},
 		{"emc", HOST_EMC_FLOOR,
 		 NVHOST_MODULE_ID_EXTERNAL_MEMORY_CONTROLLER,
-		 0, TEGRA_BWMGR_SET_EMC_SHARED_BW}
+		 TEGRA_SET_EMC_SHARED_BW}
 	},
 	.engine_cg_regs		= t18x_nvjpg_gating_registers,
 	.engine_can_cg		= true,
 	.poweron_reset		= true,
-	.finalize_poweron	= nvhost_flcn_t186_finalize_poweron,
+	.finalize_poweron	= nvhost_flcn_finalize_poweron_t186,
 	.moduleid		= NVHOST_MODULE_NVJPG,
 	.num_channels		= 1,
 	.firmware_name		= "nvhost_nvjpg011.fw",
@@ -346,7 +284,7 @@ struct nvhost_device_data t18_nvjpg_info = {
 };
 #endif
 
-#if defined(CONFIG_TEGRA_GRHOST_TSEC)
+#if IS_ENABLED(CONFIG_TEGRA_GRHOST_TSEC)
 struct nvhost_device_data t18_tsec_info = {
 	.num_channels		= 1,
 	.devfs_name		= "tsec",
@@ -354,10 +292,10 @@ struct nvhost_device_data t18_tsec_info = {
 	.modulemutexes		= {NV_HOST1X_MLOCK_ID_TSEC},
 	.class			= NV_TSEC_CLASS_ID,
 	.clocks			= {
-		{"tsec", UINT_MAX, 0, TEGRA_MC_CLIENT_TSEC},
+		{"tsec", UINT_MAX, 0},
 		{"emc", HOST_EMC_FLOOR,
 		 NVHOST_MODULE_ID_EXTERNAL_MEMORY_CONTROLLER,
-		 0, TEGRA_BWMGR_SET_EMC_FLOOR}
+		 TEGRA_SET_EMC_FLOOR}
 	},
 	.engine_cg_regs		= t18x_tsec_gating_registers,
 	.engine_can_cg		= true,
@@ -366,7 +304,7 @@ struct nvhost_device_data t18_tsec_info = {
 	.keepalive		= true,
 	.moduleid		= NVHOST_MODULE_TSEC,
 	.poweron_reset		= true,
-	.finalize_poweron	= nvhost_tsec_t186_finalize_poweron,
+	.finalize_poweron	= nvhost_tsec_finalize_poweron_t186,
 	.prepare_poweroff	= nvhost_tsec_prepare_poweroff,
 	.serialize		= 1,
 	.push_work_done		= 1,
@@ -385,10 +323,10 @@ struct nvhost_device_data t18_tsecb_info = {
 	.modulemutexes		= {NV_HOST1X_MLOCK_ID_TSECB},
 	.class			= NV_TSECB_CLASS_ID,
 	.clocks			= {
-		{"tsecb", UINT_MAX, 0, TEGRA_MC_CLIENT_TSECB},
+		{"tsecb", UINT_MAX, 0},
 		{"emc", HOST_EMC_FLOOR,
 		 NVHOST_MODULE_ID_EXTERNAL_MEMORY_CONTROLLER,
-		 0, TEGRA_BWMGR_SET_EMC_FLOOR}
+		 TEGRA_SET_EMC_FLOOR}
 	},
 	.engine_cg_regs		= t18x_tsec_gating_registers,
 	.engine_can_cg		= true,
@@ -397,7 +335,7 @@ struct nvhost_device_data t18_tsecb_info = {
 	.keepalive		= true,
 	.moduleid		= NVHOST_MODULE_TSECB,
 	.poweron_reset		= true,
-	.finalize_poweron	= nvhost_tsec_t186_finalize_poweron,
+	.finalize_poweron	= nvhost_tsec_finalize_poweron_t186,
 	.prepare_poweroff	= nvhost_tsec_prepare_poweroff,
 	.serialize		= 1,
 	.push_work_done		= 1,
@@ -410,7 +348,7 @@ struct nvhost_device_data t18_tsecb_info = {
 };
 #endif
 
-#if defined(CONFIG_TEGRA_GRHOST_VIC)
+#if IS_ENABLED(CONFIG_TEGRA_GRHOST_VIC)
 struct nvhost_device_data t18_vic_info = {
 	.num_channels		= 1,
 	.devfs_name		= "vic",
@@ -418,7 +356,7 @@ struct nvhost_device_data t18_vic_info = {
 		{"vic", UINT_MAX, 0},
 		{"emc", HOST_EMC_FLOOR,
 		 NVHOST_MODULE_ID_EXTERNAL_MEMORY_CONTROLLER,
-		 0, TEGRA_BWMGR_SET_EMC_SHARED_BW},
+		 TEGRA_SET_EMC_SHARED_BW},
 	},
 	.engine_cg_regs		= t18x_vic_gating_registers,
 	.engine_can_cg		= true,
@@ -429,7 +367,7 @@ struct nvhost_device_data t18_vic_info = {
 	.poweron_reset		= true,
 	.modulemutexes		= {NV_HOST1X_MLOCK_ID_VIC},
 	.class			= NV_GRAPHICS_VIC_CLASS_ID,
-	.finalize_poweron	= nvhost_flcn_t186_finalize_poweron,
+	.finalize_poweron	= nvhost_flcn_finalize_poweron_t186,
 	.prepare_poweroff	= nvhost_flcn_prepare_poweroff,
 	.flcn_isr		= nvhost_flcn_common_isr,
 	.init_class_context	= nvhost_vic_init_context,
@@ -458,7 +396,7 @@ struct nvhost_device_data t18_vic_info = {
 };
 #endif
 
-#if defined(CONFIG_TEGRA_GRHOST_NVCSI)
+#if IS_ENABLED(CONFIG_TEGRA_GRHOST_NVCSI)
 struct nvhost_device_data t18_nvcsi_info = {
 	.num_channels		= 1,
 	.clocks			= {
@@ -477,7 +415,6 @@ struct nvhost_device_data t18_nvcsi_info = {
 	.keepalive		= true,
 	.serialize		= 1,
 	.push_work_done		= 1,
-	.no_platform_dma_mask	= true,
 };
 #endif
 
@@ -510,6 +447,10 @@ static void t186_init_regs(struct platform_device *pdev, bool prod)
 	struct nvhost_gating_register *regs = t18x_host1x_gating_registers;
 	struct nvhost_streamid_mapping *map_regs = t18x_host1x_streamid_mapping;
 
+	if (nvhost_dev_is_virtual(pdev) == true) {
+		return;
+	}
+
 	while (regs->addr) {
 		if (prod)
 			host1x_hypervisor_writel(pdev, regs->addr, regs->prod);
@@ -536,7 +477,7 @@ static void t186_init_regs(struct platform_device *pdev, bool prod)
 #include "host1x/host1x_intr_t186.c"
 #include "host1x/host1x_debug_t186.c"
 #include "host1x/host1x_vm_t186.c"
-#if defined(CONFIG_TEGRA_GRHOST_SCALE)
+#if IS_ENABLED(CONFIG_TEGRA_GRHOST_SCALE)
 #include "host1x/host1x_actmon_t186.c"
 #endif
 
@@ -561,7 +502,7 @@ int nvhost_init_t186_support(struct nvhost_master *host,
 	op->syncpt = host1x_syncpt_ops;
 	op->intr = host1x_intr_ops;
 	op->vm = host1x_vm_ops;
-#if defined(CONFIG_TEGRA_GRHOST_SCALE)
+#if IS_ENABLED(CONFIG_TEGRA_GRHOST_SCALE)
 	op->actmon = host1x_actmon_ops;
 #endif
 

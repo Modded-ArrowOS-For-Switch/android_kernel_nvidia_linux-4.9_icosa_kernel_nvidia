@@ -1,7 +1,7 @@
 /*
 * Tegra flcn common driver
 *
-* Copyright (c) 2011-2018, NVIDIA CORPORATION.  All rights reserved.
+* Copyright (c) 2011-2022, NVIDIA CORPORATION.  All rights reserved.
 *
 * This program is free software; you can redistribute it and/or modify it
 * under the terms and conditions of the GNU General Public License,
@@ -25,34 +25,30 @@
 #include <linux/of_device.h>
 #include <linux/of_platform.h>
 #include <linux/dma-mapping.h>
-#include <linux/tegra-powergate.h>
-#include <soc/tegra/chip-id.h>
-#include <linux/tegra_pm_domains.h>
 #include <linux/module.h>
 #include <linux/version.h>
 #include <linux/iopoll.h>
+#include <linux/string.h>
 
 #include "dev.h"
 #include "class_ids.h"
+#include "class_ids_t194.h"
 #include "bus_client.h"
 #include "nvhost_acm.h"
 #include "nvhost_vm.h"
 #include "nvhost_scale.h"
 #include "nvhost_channel.h"
+#include "platform.h"
 
 #include "flcn.h"
 #include "hw_flcn.h"
 
-#include "t124/hardware_t124.h" /* for nvhost opcodes*/
-#include "t124/t124.h"
+#include "host1x/host1x04_hardware.h" /* for nvhost opcodes*/
 #include "t210/t210.h"
 
-#ifdef CONFIG_ARCH_TEGRA_18x_SOC
 #include "t186/t186.h"
-#endif
-#ifdef CONFIG_TEGRA_T19X_GRHOST
 #include "t194/t194.h"
-#endif
+
 
 static int nvhost_flcn_init_sw(struct platform_device *dev);
 static int nvhost_flcn_deinit_sw(struct platform_device *dev);
@@ -148,7 +144,6 @@ static int flcn_dma_pa_to_internal_256b(struct platform_device *pdev,
 					phys_addr_t pa, u32 internal_offset,
 					bool imem)
 {
-	struct nvhost_device_data *pdata = nvhost_get_devdata(pdev);
 	u32 cmd = flcn_dmatrfcmd_size_256b_f();
 	u32 pa_offset =  flcn_dmatrffboffs_offs_f(pa);
 	u32 i_offset = flcn_dmatrfmoffs_offs_f(internal_offset);
@@ -156,8 +151,7 @@ static int flcn_dma_pa_to_internal_256b(struct platform_device *pdev,
 	if (imem)
 		cmd |= flcn_dmatrfcmd_imem_true_f();
 
-	if (pdata->isolate_contexts)
-		cmd |= flcn_dmatrfcmd_dmactx_f(1);
+	cmd |= flcn_dmatrfcmd_dmactx_f(1);
 
 	host1x_writel(pdev, flcn_dmatrfmoffs_r(), i_offset);
 	host1x_writel(pdev, flcn_dmatrffboffs_r(), pa_offset);
@@ -205,50 +199,6 @@ err:
 	return ret;
 }
 
-static int flcn_setup_ucode_fce(struct platform_device *dev,
-				struct flcn *v,
-				struct ucode_v1_flcn *ucode)
-{
-	u32 *ucode_ptr = v->mapped;
-	struct nvhost_device_data *pdata = platform_get_drvdata(dev);
-
-	if (ucode->bin_header->fce_bin_header_offset == 0xa5a5a5a5)
-		return 0;
-
-	ucode->fce_header = (struct ucode_fce_header_v1_flcn *)
-			(((void *)ucode_ptr) +
-		 ucode->bin_header->fce_bin_header_offset);
-
-	nvhost_dbg_info("fce ucode header: offset, buffer_size, size: 0x%x 0x%x 0x%x",
-			ucode->fce_header->fce_ucode_offset,
-			ucode->fce_header->fce_ucode_buffer_size,
-			ucode->fce_header->fce_ucode_size);
-
-	/* if isolation is enabled.. */
-	if (pdata->isolate_contexts) {
-		/* create and map fce shadow to all contexts */
-		v->fce_mapped = nvhost_vm_allocate_firmware_area(dev,
-					ucode->fce_header->fce_ucode_size,
-					&v->fce_dma_addr);
-		if (!v->fce_mapped)
-			return -ENOMEM;
-
-		memcpy(v->fce_mapped, (u8 *)v->mapped +
-			ucode->bin_header->fce_bin_data_offset,
-			ucode->fce_header->fce_ucode_size);
-	} else {
-		/* ..otherwise use the one in firmware image */
-		v->fce_dma_addr = v->dma_addr +
-					ucode->bin_header->fce_bin_data_offset;
-	}
-
-	v->fce.size = ucode->fce_header->fce_ucode_size;
-	v->fce.data_offset = ucode->bin_header->fce_bin_data_offset;
-
-	return 0;
-}
-
-
 int flcn_setup_ucode_image(struct platform_device *dev,
 			   struct flcn *v,
 			   const struct firmware *ucode_fw,
@@ -291,10 +241,6 @@ int flcn_setup_ucode_image(struct platform_device *dev,
 			ucode->bin_header->os_bin_header_offset,
 			ucode->bin_header->os_bin_data_offset,
 			ucode->bin_header->os_bin_size);
-	nvhost_dbg_info("ucode bin header: fce bin (header,data) offset size: 0x%x, 0x%x %d",
-			ucode->bin_header->fce_bin_header_offset,
-			ucode->bin_header->fce_bin_data_offset,
-			ucode->bin_header->fce_bin_size);
 
 	ucode->os_header = (struct ucode_os_header_v1_flcn *)
 		(((void *)ucode_ptr) + ucode->bin_header->os_bin_header_offset);
@@ -314,7 +260,6 @@ int flcn_setup_ucode_image(struct platform_device *dev,
 	v->os.data_size   = ucode->os_header->os_data_size;
 	v->os.code_size = ucode->os_header->os_code_size;
 	v->os.bin_magic = ucode->bin_header->bin_magic;
-	v->os.bin_ver_tag = ucode->bin_header->bin_ver_tag;
 
 	return 0;
 }
@@ -337,21 +282,42 @@ int flcn_reload_fw(struct platform_device *pdev)
 	return 0;
 }
 
+static int get_dma_attrs(struct platform_device *dev, unsigned long *attrs)
+{
+#ifdef DMA_ATTR_READ_ONLY
+	*attrs = DMA_ATTR_READ_ONLY;
+	return 0;
+#else
+	struct nvhost_device_data *pdata = nvhost_get_devdata(dev);
+	if (pdata->isolate_contexts) {
+		*attrs = 0;
+		return 0;
+	} else {
+		dev_err(&dev->dev, "kernel doesn't support DMA_ATTR_READ_ONLY and context isolation is disabled!\n");
+		return -EINVAL;
+	}
+#endif
+}
+
 static int flcn_read_ucode(struct platform_device *dev,
 		    const char *fw_name,
 		    struct flcn *v)
 {
 	const struct firmware *ucode_fw;
 	struct ucode_v1_flcn ucode;
+	unsigned long attrs;
 	int err;
-	DEFINE_DMA_ATTRS(attrs);
+
+	err = get_dma_attrs(dev, &attrs);
+	if (err) {
+		return err;
+	}
 
 	nvhost_dbg_fn("");
-	dma_set_attr(DMA_ATTR_READ_ONLY, __DMA_ATTR(attrs));
 	v->dma_addr = 0;
 	v->mapped = NULL;
 
-	ucode_fw = nvhost_client_request_firmware(dev, fw_name);
+	ucode_fw = nvhost_client_request_firmware(dev, fw_name, true);
 	if (!ucode_fw) {
 		nvhost_dbg_fn("request firmware failed");
 		dev_err(&dev->dev, "failed to get firmware\n");
@@ -361,7 +327,7 @@ static int flcn_read_ucode(struct platform_device *dev,
 
 	v->size = ucode_fw->size;
 	v->mapped = dma_alloc_attrs(&dev->dev, v->size, &v->dma_addr,
-				    GFP_KERNEL, __DMA_ATTR(attrs));
+				    GFP_KERNEL, attrs);
 	if (!v->mapped) {
 		dev_err(&dev->dev, "dma memory allocation failed");
 		err = -ENOMEM;
@@ -374,12 +340,6 @@ static int flcn_read_ucode(struct platform_device *dev,
 		goto clean_up;
 	}
 
-	err = flcn_setup_ucode_fce(dev, v, &ucode);
-	if (err) {
-		dev_err(&dev->dev, "failed to parse fce image\n");
-		goto clean_up;
-	}
-
 	v->valid = true;
 	release_firmware(ucode_fw);
 
@@ -388,7 +348,7 @@ static int flcn_read_ucode(struct platform_device *dev,
 clean_up:
 	if (v->mapped) {
 		dma_free_attrs(&dev->dev, v->size, v->mapped, v->dma_addr,
-			       __DMA_ATTR(attrs));
+			       attrs);
 		v->mapped = NULL;
 		v->dma_addr = 0;
 	}
@@ -462,9 +422,45 @@ void nvhost_flcn_ctxtsw_init(struct platform_device *pdev)
 			 flcn_itfen_ctxen_enable_f()));
 }
 
+static u32 nvhost_flcn_generate_debuginfo_poison_v1(void)
+{
+	/* Fields (version 1):
+	 * - Bits 0-3:   Platform ID: 0=si, 1=qt, 2=fpga, 3=vdk
+	 * - Bits 28-31: Field format version: 1=(this version)
+	 */
+	const u32 field_fmt_ver = 0x1;
+
+	/* Silicon (default value) */
+	u32 platform_id = 0x0;
+
+	/* Special values for alternative platforms */
+	if (tegra_platform_is_qt())
+		platform_id = 0x1;
+	else if (tegra_platform_is_fpga())
+		platform_id = 0x2;
+	else if (tegra_platform_is_vdk())
+		platform_id = 0x3;
+
+	return ((field_fmt_ver << 28) | (platform_id & 0xf));
+}
+
+static u32 nvhost_flcn_generate_debuginfo_poison(void)
+{
+	/* This value allows passing extra debug information
+	 * to the engine before boot.
+	 */
+
+	/* Use version 1 */
+	return nvhost_flcn_generate_debuginfo_poison_v1();
+}
+
 int nvhost_flcn_start(struct platform_device *pdev, u32 bootvec)
 {
 	int err = 0;
+
+	/* write poison before falcon boot */
+	host1x_writel(pdev, flcn_debuginfo_r(),
+		      nvhost_flcn_generate_debuginfo_poison());
 
 	/* boot falcon */
 	dev_dbg(&pdev->dev, "flcn_boot: start falcon\n");
@@ -478,6 +474,17 @@ int nvhost_flcn_start(struct platform_device *pdev, u32 bootvec)
 	return err;
 }
 
+void flcn_enable_thi_sec(struct platform_device *pdev)
+{
+	host1x_writel(pdev, 0x38, BIT(8));
+}
+
+int nvhost_flcn_finalize_poweron_t186(struct platform_device *pdev)
+{
+	flcn_enable_thi_sec(pdev);
+
+	return nvhost_flcn_finalize_poweron(pdev);
+}
 
 int nvhost_flcn_finalize_poweron(struct platform_device *pdev)
 {
@@ -494,6 +501,10 @@ int nvhost_flcn_finalize_poweron(struct platform_device *pdev)
 	if (err)
 		return err;
 
+	if (pdata->memory_init && !tegra_platform_is_sim())
+		if (pdata->memory_init(pdev))
+			return err;
+
 	/* load transcfg configuration if defined */
 	if (pdata->transcfg_addr)
 		host1x_writel(pdev, pdata->transcfg_addr, pdata->transcfg_val);
@@ -509,6 +520,9 @@ int nvhost_flcn_finalize_poweron(struct platform_device *pdev)
 
 	nvhost_flcn_ctxtsw_init(pdev);
 	err = nvhost_flcn_start(pdev, 0);
+
+	if (!tegra_platform_is_silicon() && !strstr(dev_name(&pdev->dev), "nvjpg"))
+		host1x_writel(pdev, sec_intf_crc_ctrl_r(), 1u);
 
 	return err;
 }
@@ -566,22 +580,20 @@ static int nvhost_flcn_init_sw(struct platform_device *dev)
 static int nvhost_flcn_deinit_sw(struct platform_device *dev)
 {
 	struct flcn *v = get_flcn(dev);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 9, 0)
-	DEFINE_DMA_ATTRS(attrs);
-	dma_set_attr(DMA_ATTR_READ_ONLY, &attrs);
-#endif
+	unsigned long attrs;
+	int err;
+
+	err = get_dma_attrs(dev, &attrs);
+	if (err) {
+		return err;
+	}
 
 	if (!v)
 		return 0;
 
 	if (v->mapped) {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 9, 0)
 		dma_free_attrs(&dev->dev, v->size, v->mapped, v->dma_addr,
-			       &attrs);
-#else
-		dma_free_attrs(&dev->dev, v->size, v->mapped, v->dma_addr,
-			       DMA_ATTR_READ_ONLY);
-#endif
+			       attrs);
 		v->mapped = NULL;
 		v->dma_addr = 0;
 	}
@@ -592,25 +604,15 @@ static int nvhost_flcn_deinit_sw(struct platform_device *dev)
 
 int nvhost_vic_finalize_poweron(struct platform_device *pdev)
 {
-	struct flcn *v;
 	int err;
 
 	err = nvhost_flcn_finalize_poweron(pdev);
 	if (err)
 		return err;
 
-	v = get_flcn(pdev);
-
 	host1x_writel(pdev, FLCN_UCLASS_METHOD_OFFSET * 4,
 		      NVA0B6_VIDEO_COMPOSITOR_SET_APPLICATION_ID >> 2);
 	host1x_writel(pdev, FLCN_UCLASS_METHOD_DATA * 4, 1);
-	host1x_writel(pdev, FLCN_UCLASS_METHOD_OFFSET * 4,
-		      NVA0B6_VIDEO_COMPOSITOR_SET_FCE_UCODE_SIZE >> 2);
-	host1x_writel(pdev, FLCN_UCLASS_METHOD_DATA * 4, v->fce.size);
-	host1x_writel(pdev, FLCN_UCLASS_METHOD_OFFSET * 4,
-		      NVA0B6_VIDEO_COMPOSITOR_SET_FCE_UCODE_OFFSET >> 2);
-	host1x_writel(pdev, FLCN_UCLASS_METHOD_DATA * 4,
-		      (v->dma_addr + v->fce.data_offset) >> 8);
 
 	return 0;
 }
@@ -618,15 +620,6 @@ int nvhost_vic_finalize_poweron(struct platform_device *pdev)
 int nvhost_vic_init_context(struct platform_device *pdev,
 			    struct nvhost_cdma *cdma)
 {
-	struct flcn *v;
-	int err;
-
-	err = nvhost_flcn_init_sw(pdev);
-	if (err)
-		return err;
-
-	v = get_flcn(pdev);
-
 	/* load application id */
 	nvhost_cdma_push(cdma,
 		nvhost_opcode_setclass(NV_GRAPHICS_VIC_CLASS_ID,
@@ -635,25 +628,6 @@ int nvhost_vic_init_context(struct platform_device *pdev,
 	nvhost_cdma_push(cdma,
 		nvhost_opcode_setclass(NV_GRAPHICS_VIC_CLASS_ID,
 				       FLCN_UCLASS_METHOD_DATA, 1), 1);
-
-	/* set fce ucode size */
-	nvhost_cdma_push(cdma,
-		nvhost_opcode_setclass(NV_GRAPHICS_VIC_CLASS_ID,
-			FLCN_UCLASS_METHOD_OFFSET, 1),
-		NVA0B6_VIDEO_COMPOSITOR_SET_FCE_UCODE_SIZE >> 2);
-	nvhost_cdma_push(cdma,
-		nvhost_opcode_setclass(NV_GRAPHICS_VIC_CLASS_ID,
-			FLCN_UCLASS_METHOD_DATA, 1), v->fce.size);
-
-	/* set fce ucode offset */
-	nvhost_cdma_push(cdma,
-		nvhost_opcode_setclass(NV_GRAPHICS_VIC_CLASS_ID,
-			FLCN_UCLASS_METHOD_OFFSET, 1),
-		NVA0B6_VIDEO_COMPOSITOR_SET_FCE_UCODE_OFFSET >> 2);
-	nvhost_cdma_push(cdma,
-		nvhost_opcode_setclass(NV_GRAPHICS_VIC_CLASS_ID,
-			FLCN_UCLASS_METHOD_DATA, 1),
-		v->fce_dma_addr >> 8);
 
 	return 0;
 }
@@ -699,50 +673,19 @@ int nvhost_vic_aggregate_constraints(struct platform_device *dev,
 }
 
 static struct of_device_id tegra_flcn_of_match[] = {
-#ifdef CONFIG_TEGRA_GRHOST_VIC
-	{ .compatible = "nvidia,tegra124-vic",
-		.data = (struct nvhost_device_data *)&t124_vic_info },
+#if IS_ENABLED(CONFIG_TEGRA_GRHOST_VIC)
 	{ .compatible = "nvidia,tegra210-vic",
 		.data = (struct nvhost_device_data *)&t21_vic_info },
-#endif
-#if defined(CONFIG_TEGRA_GRHOST_NVENC)
-	{ .compatible = "nvidia,tegra124-msenc",
-		.data = (struct nvhost_device_data *)&t124_msenc_info },
-#endif
-#ifdef TEGRA_21X_OR_HIGHER_CONFIG
-#if defined(CONFIG_TEGRA_GRHOST_NVENC)
-	{ .compatible = "nvidia,tegra210-nvenc",
-		.data = (struct nvhost_device_data *)&t21_msenc_info },
-#endif
-#endif
-#ifdef TEGRA_21X_OR_HIGHER_CONFIG
-	{ .compatible = "nvidia,tegra210-nvjpg",
-		.data = (struct nvhost_device_data *)&t21_nvjpg_info },
-#endif
-#ifdef CONFIG_ARCH_TEGRA_18x_SOC
-#if defined(CONFIG_TEGRA_GRHOST_VIC)
 	{ .compatible = "nvidia,tegra186-vic",
 		.data = (struct nvhost_device_data *)&t18_vic_info },
-#endif
-#if defined(CONFIG_TEGRA_GRHOST_NVJPG)
-	{ .compatible = "nvidia,tegra186-nvjpg",
-		.data = (struct nvhost_device_data *)&t18_nvjpg_info },
-#endif
-#if defined(CONFIG_TEGRA_GRHOST_NVENC)
-	{ .compatible = "nvidia,tegra186-nvenc",
-		.data = (struct nvhost_device_data *)&t18_msenc_info },
-#endif
-#endif
-#ifdef CONFIG_TEGRA_T19X_GRHOST
-#if defined(CONFIG_TEGRA_GRHOST_VIC)
 	{ .compatible = "nvidia,tegra194-vic",
 		.data = (struct nvhost_device_data *)&t19_vic_info },
 #endif
-#if defined(CONFIG_TEGRA_GRHOST_NVJPG)
-	{ .compatible = "nvidia,tegra194-nvjpg",
-		.data = (struct nvhost_device_data *)&t19_nvjpg_info },
-#endif
-#if defined(CONFIG_TEGRA_GRHOST_NVENC)
+#if IS_ENABLED(CONFIG_TEGRA_GRHOST_NVENC)
+	{ .compatible = "nvidia,tegra210-nvenc",
+		.data = (struct nvhost_device_data *)&t21_msenc_info },
+	{ .compatible = "nvidia,tegra186-nvenc",
+		.data = (struct nvhost_device_data *)&t18_msenc_info },
 	{ .compatible = "nvidia,tegra194-nvenc",
 		.data = (struct nvhost_device_data *)&t19_msenc_info,
 		.name = "nvenc" },
@@ -750,6 +693,13 @@ static struct of_device_id tegra_flcn_of_match[] = {
 		.data = (struct nvhost_device_data *)&t19_nvenc1_info,
 		.name = "nvenc1" },
 #endif
+#if IS_ENABLED(CONFIG_TEGRA_GRHOST_NVJPG)
+	{ .compatible = "nvidia,tegra210-nvjpg",
+		.data = (struct nvhost_device_data *)&t21_nvjpg_info },
+	{ .compatible = "nvidia,tegra186-nvjpg",
+		.data = (struct nvhost_device_data *)&t18_nvjpg_info },
+	{ .compatible = "nvidia,tegra194-nvjpg",
+		.data = (struct nvhost_device_data *)&t19_nvjpg_info },
 #endif
 	{ },
 };
@@ -798,6 +748,15 @@ static int flcn_probe(struct platform_device *dev)
 
 	nvhost_dbg_fn("dev:%p pdata:%p", dev, pdata);
 
+	if (nvhost_is_194() &&
+	    (tegra_get_sku_id() == 0x9F ||
+	     tegra_get_sku_id() == 0x9E) &&
+	    pdata->class == NV_VIDEO_ENCODE_NVENC1_CLASS_ID) {
+		dev_err(&dev->dev, "NVENC1 IP is disabled in SKU\n");
+		err = -ENODEV;
+		return err;
+	}
+
 	pdata->pdev = dev;
 	mutex_init(&pdata->lock);
 	platform_set_drvdata(dev, pdata);
@@ -835,14 +794,7 @@ static int __exit flcn_remove(struct platform_device *pdev)
 	return 0;
 }
 
-static struct platform_device_id flcn_id_table[] = {
-	{ .name = "vic03" },
-	{ .name = "msenc" },
-	{ .name = "msenc" },
-	{ .name = "nvjpg" },
-	{},
-};
-static struct platform_driver flcn_driver = {
+struct platform_driver nvhost_flcn_driver = {
 	.probe = flcn_probe,
 	.remove = __exit_p(flcn_remove),
 	.driver = {
@@ -856,74 +808,22 @@ static struct platform_driver flcn_driver = {
 #endif
 		.suppress_bind_attrs = true,
 	},
-	.id_table = flcn_id_table,
 };
 
-static struct of_device_id tegra_flcn_domain_match[] = {
-#ifdef CONFIG_TEGRA_GRHOST_VIC
-	{.compatible = "nvidia,tegra124-vic03-pd",
-	.data = (struct nvhost_device_data *)&t124_vic_info},
-	{.compatible = "nvidia,tegra132-vic03-pd",
-	.data = (struct nvhost_device_data *)&t124_vic_info},
-#endif
-#if defined(CONFIG_TEGRA_GRHOST_NVENC)
-	{.compatible = "nvidia,tegra124-msenc-pd",
-	.data = (struct nvhost_device_data *)&t124_msenc_info},
-	{.compatible = "nvidia,tegra132-msenc-pd",
-	.data = (struct nvhost_device_data *)&t124_msenc_info},
-#endif
-#ifdef CONFIG_TEGRA_GRHOST_VIC
+#if IS_ENABLED(CONFIG_TEGRA_GRHOST_LEGACY_PD)
+struct of_device_id nvhost_flcn_domain_match[] = {
+#if IS_ENABLED(CONFIG_TEGRA_GRHOST_VIC)
 	{.compatible = "nvidia,tegra210-vic03-pd",
 	 .data = (struct nvhost_device_data *)&t21_vic_info},
 #endif
-#ifdef TEGRA_21X_OR_HIGHER_CONFIG
-#if defined(CONFIG_TEGRA_GRHOST_NVENC)
+#if IS_ENABLED(CONFIG_TEGRA_GRHOST_NVENC)
 	{.compatible = "nvidia,tegra210-msenc-pd",
 	 .data = (struct nvhost_device_data *)&t21_msenc_info},
 #endif
-#if defined(CONFIG_TEGRA_GRHOST_NVJPG)
+#if IS_ENABLED(CONFIG_TEGRA_GRHOST_NVJPG)
 	{.compatible = "nvidia,tegra210-nvjpg-pd",
 	 .data = (struct nvhost_device_data *)&t21_nvjpg_info},
 #endif
-#endif
-#ifdef CONFIG_ARCH_TEGRA_18x_SOC
-#if defined(CONFIG_TEGRA_GRHOST_VIC)
-	{.compatible = "nvidia,tegra186-vic03-pd",
-	 .data = (struct nvhost_device_data *)&t18_vic_info},
-#endif
-#if defined(CONFIG_TEGRA_GRHOST_NVENC)
-	{.compatible = "nvidia,tegra186-msenc-pd",
-	 .data = (struct nvhost_device_data *)&t18_msenc_info},
-#endif
-#if defined(CONFIG_TEGRA_GRHOST_NVJPG)
-	{.compatible = "nvidia,tegra186-nvjpg-pd",
-	 .data = (struct nvhost_device_data *)&t18_nvjpg_info},
-#endif
-#endif
-#ifdef CONFIG_TEGRA_T19X_GRHOST
-#if defined(CONFIG_TEGRA_GRHOST_NVENC)
-	{.compatible = "nvidia,tegra194-nvenc1-pd",
-	 .data = (struct nvhost_device_data *)&t19_nvenc1_info},
-#endif
-#endif
 	{},
 };
-
-static int __init flcn_init(void)
-{
-	int ret;
-
-	ret = nvhost_domain_init(tegra_flcn_domain_match);
-	if (ret)
-		return ret;
-
-	return platform_driver_register(&flcn_driver);
-}
-
-static void __exit flcn_exit(void)
-{
-	platform_driver_unregister(&flcn_driver);
-}
-
-module_init(flcn_init);
-module_exit(flcn_exit);
+#endif

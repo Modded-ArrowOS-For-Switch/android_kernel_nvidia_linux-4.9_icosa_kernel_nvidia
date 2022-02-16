@@ -3,7 +3,7 @@
  *
  * AMC and ARAM handling
  *
- * Copyright (C) 2014-2017, NVIDIA Corporation. All rights reserved.
+ * Copyright (C) 2014-2020, NVIDIA Corporation. All rights reserved.
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -19,6 +19,12 @@
 #include <linux/tegra_nvadsp.h>
 #include <linux/irqchip/tegra-agic.h>
 #include <linux/interrupt.h>
+#include <linux/version.h>
+#if KERNEL_VERSION(4, 15, 0) > LINUX_VERSION_CODE
+#include <soc/tegra/chip-id.h>
+#else
+#include <soc/tegra/fuse.h>
+#endif
 
 #include "dev.h"
 #include "amc.h"
@@ -170,7 +176,7 @@ void nvadsp_free_amc_interrupts(struct platform_device *pdev)
 
 	node = dev->of_node;
 
-	if (!of_device_is_compatible(node, "nvidia,tegra18x-adsp-hv"))
+	if (!is_tegra_hypervisor_mode())
 		devm_free_irq(dev, drv->agic_irqs[AMC_ERR_VIRQ], pdev);
 }
 
@@ -185,7 +191,7 @@ int nvadsp_setup_amc_interrupts(struct platform_device *pdev)
 	nvadsp_pdev = pdev;
 	nvadsp_drv_data = drv;
 
-	if (!of_device_is_compatible(node, "nvidia,tegra18x-adsp-hv"))
+	if (!is_tegra_hypervisor_mode())
 		ret = devm_request_irq(dev, drv->agic_irqs[AMC_ERR_VIRQ],
 			nvadsp_amc_error_int_handler, 0,
 			"AMC error int", pdev);

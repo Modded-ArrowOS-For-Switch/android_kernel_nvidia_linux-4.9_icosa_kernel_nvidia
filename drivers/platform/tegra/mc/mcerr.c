@@ -1,9 +1,5 @@
 /*
- * arch/arm/mach-tegra/mcerr.c
- *
- * MC error code common to T3x and T11x. T20 has been left alone.
- *
- * Copyright (c) 2010-2018, NVIDIA Corporation. All rights reserved.
+ * Copyright (c) 2010-2020, NVIDIA Corporation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -40,9 +36,8 @@
 #include <linux/platform/tegra/mcerr.h>
 #include <linux/platform/tegra/tegra_emc_err.h>
 #include <linux/platform/tegra/mc-regs-t18x.h>
+#include <linux/platform/tegra/mc-regs-t19x.h>
 
-static const struct of_device_id __mcerr_of_table_sentinel
-	__used __section(__mcerr_of_table_end);
 extern struct of_device_id __mcerr_of_table;
 
 static bool mcerr_throttle_enabled = true;
@@ -53,6 +48,7 @@ static void unthrottle_prints(struct work_struct *work);
 static DECLARE_DELAYED_WORK(unthrottle_prints_work, unthrottle_prints);
 static struct dentry *mcerr_debugfs_dir;
 u32 mc_int_mask;
+u32 mc_hub_int_mask;
 static struct mcerr_ops *mcerr_ops;
 
 static void unthrottle_prints(struct work_struct *work)
@@ -63,11 +59,13 @@ static void unthrottle_prints(struct work_struct *work)
 static void disable_interrupt(unsigned int irq)
 {
 	mc_writel(0, MC_INTMASK);
+	mc_writel(0, MC_HUB_INTMASK);
 }
 
 static void enable_interrupt(unsigned int irq)
 {
 	mc_writel(mc_int_mask, MC_INTMASK);
+	mc_writel(mc_hub_int_mask, MC_HUB_INTMASK);
 }
 
 static irqreturn_t tegra_mcerr_thread(int irq, void *data)
@@ -229,26 +227,36 @@ int tegra_mcerr_init(struct dentry *mc_parent, struct platform_device *pdev)
 		return -EINVAL;
 	}
 
+	/* clear any mc-err's that occured before. */
+	mcerr_ops->clear_interrupt(0);
+
+	mc_int_mask = be32_to_cpup(prop);
+	mc_writel(mc_int_mask, MC_INTMASK);
+	pr_debug("Set intmask: 0x%x\n", mc_readl(MC_INTMASK));
+
+	/* Read mc_hub_intmask, the register is available from T19x, onwards */
+	prop = of_get_property(pdev->dev.of_node, "hub_int_mask", NULL);
+	if (prop) {
+		mc_hub_int_mask = be32_to_cpup(prop);
+		mc_writel(mc_hub_int_mask, MC_HUB_INTMASK);
+		pr_debug("Set mc_hub_intmask: 0x%x\n",
+			mc_readl(MC_HUB_INTMASK));
+	}
+
 	irq = irq_of_parse_and_map(pdev->dev.of_node, 0);
 	if (irq < 0) {
 		pr_err("Unable to parse/map MC error interrupt\n");
 		goto done;
 	}
 
-	if (request_threaded_irq(irq, tegra_mcerr_hard_irq,
-				 tegra_mcerr_thread, 0, "mc_status", NULL)) {
+	if (request_threaded_irq(irq, tegra_mcerr_hard_irq, tegra_mcerr_thread,
+				 IRQF_SHARED, "mc_status", pdev)) {
 		pr_err("Unable to register MC error interrupt\n");
 		goto done;
 	}
 
-	mc_int_mask = be32_to_cpup(prop);
-	/* clear any mc-err's that occured before. */
-	mcerr_ops->clear_interrupt(irq);
-	mc_writel(mc_int_mask, MC_INTMASK);
-	pr_debug("Set intmask: 0x%x\n", mc_readl(MC_INTMASK));
-
 	/* This need to be fixed to work for all SOC's. */
-	if (IS_ENABLED(CONFIG_ARCH_TEGRA_18x_SOC)) {
+	if (IS_ENABLED(CONFIG_ARCH_TEGRA_18x_SOC) || IS_ENABLED(CONFIG_ARCH_TEGRA_186_SOC)) {
 		prop = of_get_property(pdev->dev.of_node,"compatible", NULL);
 		if (prop && strcmp(prop, "nvidia,tegra-t18x-mc") == 0)
 			tegra_emcerr_init(mc_parent, pdev);

@@ -3,7 +3,7 @@
  *
  * NVIDIA Tegra Sysfs for BCMDHD driver
  *
- * Copyright (C) 2014-2019 NVIDIA Corporation. All rights reserved.
+ * Copyright (c) 2014-2021 NVIDIA CORPORATION. All rights reserved.
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -16,6 +16,7 @@
  *
  */
 
+#include <linux/version.h>
 #include "dhd_custom_sysfs_tegra.h"
 #include "dhd_custom_sysfs_tegra_stat.h"
 #include "dhd_custom_net_diag_tegra.h"
@@ -128,7 +129,11 @@ stat_work_func(struct work_struct *work)
 	char *netif = net ? net->name : "";
 	wl_cnt_t *cnt;
 	int i;
+#if KERNEL_VERSION(5, 4, 0) > LINUX_VERSION_CODE
 	struct timespec now;
+#else
+	struct timespec64 now;
+#endif
 #ifdef CONFIG_BCMDHD_CUSTOM_NET_BW_EST_TEGRA
 	tegra_net_diag_data_t net_diag_data;
 	int bwValue;
@@ -171,6 +176,12 @@ stat_work_func(struct work_struct *work)
 				? 64 : sizeof(wl_cnt_t) - i,
 			0);
 	}
+#ifdef CONFIG_BCMDHD_CUSTOM_NET_BW_EST_TEGRA
+	if (bcmdhd_stat.driver_stat.cur_bw_est == 1) {
+		memset(&net_diag_data, 0, sizeof(tegra_net_diag_data_t));
+		tegra_net_diag_get_value(&net_diag_data);
+	}
+#endif /* CONFIG_BCMDHD_CUSTOM_NET_BW_EST_TEGRA */
 
 	/* Update the overall bcmdhd stats */
 	if (MSEC(now) - MSEC(bcmdhd_stat.time) > bcmdhd_stat_rate_ms) {
@@ -178,8 +189,10 @@ stat_work_func(struct work_struct *work)
 		TEGRA_SYSFS_HISTOGRAM_AGGR_DRV_STATE(now);
 		TEGRA_SYSFS_HISTOGRAM_AGGR_PM_STATE(now);
 #ifdef CONFIG_BCMDHD_CUSTOM_NET_BW_EST_TEGRA
-		memset(&net_diag_data, 0, sizeof(tegra_net_diag_data_t));
-		tegra_net_diag_get_value(&net_diag_data);
+		if (bcmdhd_stat.driver_stat.cur_bw_est != 1) {
+			memset(&net_diag_data, 0, sizeof(tegra_net_diag_data_t));
+			tegra_net_diag_read_value(&net_diag_data);
+		}
 		bcmdhd_stat.driver_stat.cur_bw_est = net_diag_data.bw_est;
 		bwValue = net_diag_data.bw_est;
 		roundOffBw = 0;
@@ -248,7 +261,11 @@ tegra_sysfs_histogram_stat_show(struct device *dev,
 		return 0;
 	}
 #else
+#if KERNEL_VERSION(5, 4, 0) > LINUX_VERSION_CODE
 	struct timespec now;
+#else
+	struct timespec64 now;
+#endif
 	int i, n, comma;
 #ifdef CONFIG_BCMDHD_CUSTOM_NET_BW_EST_TEGRA
 	tegra_net_diag_data_t net_diag_data;
@@ -265,7 +282,7 @@ tegra_sysfs_histogram_stat_show(struct device *dev,
 	snprintf(buf + n, PAGE_SIZE - n,
 		"{\n"
 #ifdef CONFIG_BCMDHD_CUSTOM_NET_BW_EST_TEGRA
-		"\"version\": 3.2,\n"
+		"\"version\": 3.3,\n"
 #else
 		"\"version\": 3,\n"
 #endif /* CONFIG_BCMDHD_CUSTOM_NET_BW_EST_TEGRA */
@@ -286,7 +303,8 @@ tegra_sysfs_histogram_stat_show(struct device *dev,
 		"\"hang\": %lu,\n"
 		"\"ago_start\": %lu,\n"
 		"\"connect_on_2g_channel\": %lu,\n"
-		"\"connect_on_5g_channel\": %lu,\n",
+		"\"connect_on_5g_channel\": %lu,\n"
+		"\"skb_realloc_headroom_fail\": %lu,\n",
 		MSEC(dhdstats_ts),
 		MSEC(now),
 		PRINT_DIFF(gen_stat.wifi_on_success),
@@ -304,7 +322,8 @@ tegra_sysfs_histogram_stat_show(struct device *dev,
 		PRINT_DIFF(gen_stat.hang),
 		PRINT_DIFF(gen_stat.ago_start),
 		PRINT_DIFF(gen_stat.connect_on_2g_channel),
-		PRINT_DIFF(gen_stat.connect_on_5g_channel));
+		PRINT_DIFF(gen_stat.connect_on_5g_channel),
+		PRINT_DIFF(gen_stat.skb_realloc_headroom_fail));
 
 	/* print statistics */
 	n = strlen(buf);

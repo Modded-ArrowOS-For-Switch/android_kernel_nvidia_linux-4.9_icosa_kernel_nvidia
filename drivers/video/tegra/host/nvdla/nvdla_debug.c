@@ -1,7 +1,7 @@
 /*
  * NVDLA debug utils
  *
- * Copyright (c) 2016 - 2018, NVIDIA Corporation.  All rights reserved.
+ * Copyright (c) 2016 - 2020, NVIDIA Corporation.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -19,16 +19,21 @@
 #include <linux/platform_device.h>
 #include <linux/debugfs.h>
 #include <linux/nvhost.h>
+#include <linux/uaccess.h>
+#include <linux/delay.h>
+#include <linux/version.h>
+#include <soc/tegra/fuse.h>
+#if KERNEL_VERSION(4, 15, 0) > LINUX_VERSION_CODE
+#include <soc/tegra/chip-id.h>
+#endif
+
 #include "host1x/host1x.h"
 #include "flcn/flcn.h"
 #include "flcn/hw_flcn.h"
 #include "dla_os_interface.h"
-#include <linux/uaccess.h>
-#include <soc/tegra/fuse.h>
-#include <soc/tegra/chip-id.h>
-
 #include "nvdla/nvdla.h"
 #include "nvdla_debug.h"
+#include "nvhost_acm.h"
 
 /*
  * Header in ring buffer consist (start, end) two uint32_t values.
@@ -494,6 +499,8 @@ static ssize_t debug_dla_fw_reload_set(struct file *file,
 	struct nvdla_device *nvdla_dev;
 	struct platform_device *pdev;
 	long val;
+	int ref_cnt;
+	unsigned long end_jiffies;
 
 	if (!p)
 		return -EFAULT;
@@ -511,11 +518,31 @@ static ssize_t debug_dla_fw_reload_set(struct file *file,
 	if (!val)
 		return count; /* "0" does nothing */
 
-	nvdla_dbg_info(pdev, "firmware reload requested.\n");
+
+	/* check current power ref count and make forced idle to
+	 * suspend.
+	 */
+	ref_cnt = atomic_read(&pdev->dev.power.usage_count);
+	nvhost_module_idle_mult(pdev, ref_cnt);
+
+	/* check and wait until module is idle (with a timeout) */
+	end_jiffies = jiffies + msecs_to_jiffies(2000);
+	do {
+		msleep(1);
+		ref_cnt = atomic_read(&pdev->dev.power.usage_count);
+	} while (ref_cnt != 0 && time_before(jiffies, end_jiffies));
+
+	if (ref_cnt != 0)
+		return -EBUSY;
+
+	nvdla_dbg_info(pdev, "firmware reload requesting..\n");
 
 	err = flcn_reload_fw(pdev);
 	if (err)
 		return err; /* propagate firmware reload errors */
+
+	/* make sure device in clean state by reset */
+	nvhost_module_reset(pdev, true);
 
 	return count;
 }
@@ -547,9 +574,13 @@ static ssize_t debug_dla_fw_a01_war_set(struct file *file,
 	if (val < 0) /* "0" to disable WAR, positive value to enable WAR */
 		return count;
 
-
+#if KERNEL_VERSION(4, 15, 0) > LINUX_VERSION_CODE
 	if ((tegra_get_chipid() == TEGRA_CHIPID_TEGRA19) &&
 		(tegra_chip_get_revision() == TEGRA194_REVISION_A01))
+#else
+	if ((tegra_get_chip_id() == TEGRA194) &&
+		(tegra_chip_get_revision() == TEGRA_REVISION_A01))
+#endif
 		if (val)
 			nvdla_dev->quirks |= (NVDLA_QUIRK_T194_A01_WAR);
 		else
@@ -560,43 +591,6 @@ static ssize_t debug_dla_fw_a01_war_set(struct file *file,
 	return count;
 }
 
-static int nvdla_fw_ver_tag_show(struct seq_file *s, void *unused)
-{
-	struct nvdla_device *nvdla_dev;
-	struct platform_device *pdev;
-	int err;
-	unsigned int tag;
-	struct flcn *m;
-
-	nvdla_dev = (struct nvdla_device *)s->private;
-	pdev = nvdla_dev->pdev;
-
-	/* update fw_version if engine is not yet powered on */
-	err = nvhost_module_busy(pdev);
-	if (err)
-		return err;
-
-	m = get_flcn(pdev);
-	tag = m->os.bin_ver_tag;
-
-	nvhost_module_idle(pdev);
-
-	seq_printf(s, "%x\n", tag);
-
-	return 0;
-}
-
-static int nvdla_fw_ver_tag_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, nvdla_fw_ver_tag_show, inode->i_private);
-}
-
-static const struct file_operations nvdla_fw_ver_tag_fops = {
-	.open		= nvdla_fw_ver_tag_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
 static int debug_dla_fw_reload_show(struct seq_file *s, void *data)
 {
 	seq_puts(s, "0\n");
@@ -712,10 +706,6 @@ static void dla_fw_debugfs_init(struct platform_device *pdev)
 
 	if (!debugfs_create_file("version", S_IRUGO, fw_dir,
 			nvdla_dev, &nvdla_fw_ver_fops))
-		goto trace_failed;
-
-	if (!debugfs_create_file("tag", S_IRUGO, fw_dir,
-			nvdla_dev, &nvdla_fw_ver_tag_fops))
 		goto trace_failed;
 
 	if (!debugfs_create_file("reload", 0600, fw_dir,

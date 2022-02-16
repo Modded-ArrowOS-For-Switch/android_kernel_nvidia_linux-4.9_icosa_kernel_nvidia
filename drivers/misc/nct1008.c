@@ -3,7 +3,7 @@
  *
  * Driver for NCT1008, temperature monitoring device from ON Semiconductors
  *
- * Copyright (c) 2010-2020, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2010-2021, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -71,7 +71,7 @@
 /* NOT USED                          0x1F */
 #define LOC_THERM_LIMIT              0x20
 #define THERM_HYSTERESIS             0x21
-#define COSECUTIVE_ALERT             0x22
+#define CONSECUTIVE_ALERT            0x22
 #define NFACTOR_CORRECTION           0x23
 #define MANUFACTURER_ID              0xFE
 #define MAX6649_LOC_TEMP_LO_RD       0x11
@@ -109,6 +109,9 @@
 #define THERM2_BIT         BIT(5)
 #define STANDBY_BIT        BIT(6)
 #define ALERT_BIT          BIT(7)
+
+/* Consecutive ALERT register bits. */
+#define SMBTO_BIT BIT(7) /* Enable or disable SMBus time-out */
 
 /* Status register bits */
 #define EXT_OPEN_BIT BIT(2) /* External sensor is open junction */
@@ -547,7 +550,7 @@ static ssize_t nct1008_show_regs(struct device *dev,
 	sz += pr_reg(nct, buf+sz, PAGE_SIZE-sz,
 		"Hysteresis          ", THERM_HYSTERESIS);
 	sz += pr_reg(nct, buf+sz, PAGE_SIZE-sz,
-		"Consecutive Alert   ", COSECUTIVE_ALERT);
+		"Consecutive Alert   ", CONSECUTIVE_ALERT);
 	sz += pr_reg(nct, buf+sz, PAGE_SIZE-sz,
 		"Local Temp Value    ", LOC_TEMP_RD);
 	sz += pr_reg(nct, buf+sz, PAGE_SIZE-sz,
@@ -895,20 +898,12 @@ static void nct1008_work_func(struct work_struct *work)
 	st = nct1008_read_reg(data, STATUS_RD);
 	dev_dbg(&client->dev, "%s: interrupt (0x%08x)\n", data->chip_name, st);
 	if ((st & (LOC_LO_BIT | LOC_HI_BIT)) && data->sensors[LOC].thz)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 0)
 		thermal_zone_device_update(data->sensors[LOC].thz,
 					   THERMAL_EVENT_UNSPECIFIED);
-#else
-		thermal_zone_device_update(data->sensors[LOC].thz);
-#endif
 
 	if ((st & (EXT_LO_BIT | EXT_HI_BIT)) && data->sensors[EXT].thz)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 0)
 		thermal_zone_device_update(data->sensors[EXT].thz,
 					   THERMAL_EVENT_UNSPECIFIED);
-#else
-		thermal_zone_device_update(data->sensors[EXT].thz);
-#endif
 
 	/* Initiate one-shot conversion */
 	err = nct1008_write_reg(data, ONE_SHOT, 0x1);
@@ -1155,6 +1150,16 @@ static int nct1008_sensors_init(struct nct1008_data *data)
 	struct nct1008_platform_data *pdata = &data->plat_data;
 
 	if (!pdata)
+		goto err;
+
+	/* Enable SMBus timeout */
+	temp = nct1008_read_reg(data, CONSECUTIVE_ALERT);
+	if (temp < 0)
+		goto err;
+
+	temp |= SMBTO_BIT;
+	ret = nct1008_write_reg(data, CONSECUTIVE_ALERT, temp);
+	if (ret)
 		goto err;
 
 	/* Configure sensor to trigger alerts clear THERM2_BIT and ALERT_BIT*/
@@ -1615,6 +1620,7 @@ static const struct of_device_id nct1008_of_match[] = {
 	{.compatible = "maxim,max6649", },
 	{ }
 };
+MODULE_DEVICE_TABLE(of, nct1008_of_match);
 
 static struct i2c_driver nct1008_driver = {
 	.driver = {

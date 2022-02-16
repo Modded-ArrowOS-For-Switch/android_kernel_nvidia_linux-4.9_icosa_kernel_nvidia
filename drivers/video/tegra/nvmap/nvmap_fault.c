@@ -1,7 +1,7 @@
 /*
  * drivers/video/tegra/nvmap/nvmap_fault.c
  *
- * Copyright (c) 2011-2018, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2011-2021, NVIDIA CORPORATION. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -21,19 +21,21 @@
 #include "nvmap_priv.h"
 
 static void nvmap_vma_close(struct vm_area_struct *vma);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
+#include <linux/atomic-fallback.h>
+#define __atomic_add_unless atomic_fetch_add_unless
+static vm_fault_t nvmap_vma_fault(struct vm_fault *vmf);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
 static int nvmap_vma_fault(struct vm_fault *vmf);
 #else
 static int nvmap_vma_fault(struct vm_area_struct *vma, struct vm_fault *vmf);
 #endif
-static bool nvmap_fixup_prot(struct vm_area_struct *vma,
-		unsigned long addr, pgoff_t pgoff);
 
 struct vm_operations_struct nvmap_vma_ops = {
 	.open		= nvmap_vma_open,
 	.close		= nvmap_vma_close,
 	.fault		= nvmap_vma_fault,
-	.fixup_prot	= nvmap_fixup_prot,
 };
 
 int is_nvmap_vma(struct vm_area_struct *vma)
@@ -54,7 +56,7 @@ void nvmap_vma_open(struct vm_area_struct *vma)
 	struct list_head *tmp_head = NULL;
 	pid_t current_pid = task_tgid_nr(current);
 	bool vma_pos_found = false;
-	int nr_page, i;
+	size_t nr_page, i;
 	ulong vma_open_count;
 
 	priv = vma->vm_private_data;
@@ -132,7 +134,7 @@ static void nvmap_vma_close(struct vm_area_struct *vma)
 	struct nvmap_vma_list *vma_list;
 	struct nvmap_handle *h;
 	bool vma_found = false;
-	int nr_page, i;
+	size_t nr_page, i;
 
 	if (!priv)
 		return;
@@ -174,7 +176,10 @@ static void nvmap_vma_close(struct vm_area_struct *vma)
 	}
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
+static vm_fault_t nvmap_vma_fault(struct vm_fault *vmf)
+#define vm_insert_pfn vmf_insert_pfn
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
 static int nvmap_vma_fault(struct vm_fault *vmf)
 #else
 static int nvmap_vma_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
@@ -222,6 +227,9 @@ static int nvmap_vma_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 			return VM_FAULT_SIGBUS;
 		page = nvmap_to_page(priv->handle->pgalloc.pages[offs]);
 
+		if (PageAnon(page) && (vma->vm_flags & VM_SHARED))
+			return VM_FAULT_SIGSEGV;
+
 		if (!nvmap_handle_track_dirty(priv->handle))
 			goto finish;
 
@@ -251,50 +259,4 @@ finish:
 		get_page(page);
 	vmf->page = page;
 	return (page) ? 0 : VM_FAULT_SIGBUS;
-}
-
-static bool nvmap_fixup_prot(struct vm_area_struct *vma,
-		unsigned long addr, pgoff_t pgoff)
-{
-	struct page *page;
-	struct nvmap_vma_priv *priv;
-	unsigned long offs;
-	void *kaddr;
-
-	priv = vma->vm_private_data;
-	if (!priv || !priv->handle || !priv->handle->alloc)
-		return false;
-
-	offs = pgoff << PAGE_SHIFT;
-	offs += priv->offs;
-	if ((offs >= priv->handle->size) || !priv->handle->heap_pgalloc)
-		return false;
-
-	if (atomic_read(&priv->handle->pgalloc.reserved))
-		return false;
-
-	if (!nvmap_handle_track_dirty(priv->handle))
-		return true;
-
-	mutex_lock(&priv->handle->lock);
-	offs >>= PAGE_SHIFT;
-	if (nvmap_page_dirty(priv->handle->pgalloc.pages[offs]))
-		goto unlock;
-
-	page = nvmap_to_page(priv->handle->pgalloc.pages[offs]);
-	/* inner cache maint */
-	kaddr  = kmap(page);
-	BUG_ON(!kaddr);
-	inner_cache_maint(NVMAP_CACHE_OP_WB_INV, kaddr, PAGE_SIZE);
-	kunmap(page);
-
-	if (priv->handle->flags & NVMAP_HANDLE_INNER_CACHEABLE)
-		goto make_dirty;
-
-make_dirty:
-	nvmap_page_mkdirty(&priv->handle->pgalloc.pages[offs]);
-	atomic_inc(&priv->handle->pgalloc.ndirty);
-unlock:
-	mutex_unlock(&priv->handle->lock);
-	return true;
 }

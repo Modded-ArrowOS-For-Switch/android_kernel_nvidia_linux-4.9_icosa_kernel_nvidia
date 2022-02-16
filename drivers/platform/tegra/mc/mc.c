@@ -2,7 +2,7 @@
  * arch/arm/mach-tegra/mc.c
  *
  * Copyright (C) 2010 Google, Inc.
- * Copyright (C) 2011-2018, NVIDIA Corporation.  All rights reserved.
+ * Copyright (C) 2011-2020, NVIDIA Corporation.  All rights reserved.
  *
  * Author:
  *	Erik Gilling <konkers@google.com>
@@ -365,6 +365,7 @@ err_out:
 __weak const struct of_device_id tegra_mc_of_ids[] = {
 	{ .compatible = "nvidia,tegra-mc" },
 	{ .compatible = "nvidia,tegra-t18x-mc" },
+	{ .compatible = "nvidia,tegra-t19x-mc" },
 	{ }
 };
 
@@ -448,7 +449,15 @@ static int tegra_mc_probe(struct platform_device *pdev)
 
 	tegra_mcerr_init(mc_debugfs_dir, pdev);
 
+	if (tegra_get_chip_id() == TEGRA234)
+		tegra_mc_utils_init();
+
 	return 0;
+}
+
+void __weak tegra_mc_utils_init(void)
+{
+	return;
 }
 
 u32 __weak tegra_get_dvfs_clk_change_latency_nsec(unsigned long emc_freq_khz)

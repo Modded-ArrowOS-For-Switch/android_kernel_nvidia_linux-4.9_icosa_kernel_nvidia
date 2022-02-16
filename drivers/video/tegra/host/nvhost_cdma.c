@@ -67,10 +67,6 @@ int nvhost_push_buffer_alloc(struct push_buffer *pb)
 		return -ENOMEM;
 	}
 
-	/* for now, map pushbuffer to all address spaces */
-	nvhost_vm_map_static(cdma_to_dev(cdma)->dev, pb->mapped,
-			     pb->dma_addr, PUSH_BUFFER_SIZE + 4);
-
 	return 0;
 }
 
@@ -289,7 +285,9 @@ static void cdma_start_timer_locked(struct nvhost_cdma *cdma,
  */
 static void stop_cdma_timer_locked(struct nvhost_cdma *cdma)
 {
-	cancel_delayed_work_sync(&cdma->timeout.wq);
+	if (cdma->timeout.initialized) {
+		cancel_delayed_work_sync(&cdma->timeout.wq);
+	}
 
 	mutex_lock(&cdma->timeout_lock);
 	if (cdma->timeout.clientid)

@@ -4,7 +4,7 @@
  *
  * Support for Tegra Security Engine Elliptic crypto algorithms.
  *
- * Copyright (c) 2015-2021, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2015-2020, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -29,7 +29,6 @@
 #include <linux/types.h>
 #include <linux/errno.h>
 #include <linux/version.h>
-#include <soc/tegra/chip-id.h>
 #include <crypto/akcipher.h>
 #include <crypto/hash.h>
 #include <crypto/internal/akcipher.h>
@@ -2814,7 +2813,7 @@ static int tegra_se_hash_data(struct tegra_se_elp_dev *se_dev, u32 *msg,
 	struct ahash_request *req;
 	struct tegra_crypto_completion sha_complete;
 
-	tfm = crypto_alloc_ahash(algo, CRYPTO_ALG_TESTED, 0);
+	tfm = crypto_alloc_ahash(algo, 0, 0);
 	if (IS_ERR(tfm)) {
 		dev_err(se_dev->dev, "Alloc %s hash transform failed\n", algo);
 		ret = PTR_ERR(tfm);
@@ -2856,7 +2855,7 @@ static int tegra_se_eddsa_gen_pub_key(struct crypto_akcipher *tfm,
 	u32 *secret_hash = NULL;
 	int i, j;
 	unsigned int nbytes = curve->nbytes, nwords = ctx->nwords;
-	u32 h0[nwords], h1[nwords];
+	u32 h0[SHA512_WORDS], h1[SHA512_WORDS];
 	struct tegra_se_ecc_point *pk = NULL;
 	int ret = 0;
 
@@ -3798,9 +3797,13 @@ static struct akcipher_alg pka1_rsa_algs[] = {
 		.init = tegra_se_pka1_rsa_init,
 		.exit = tegra_se_pka1_rsa_exit,
 		.base = {
-			.cra_name = "rsa-pka1",
+			.cra_name = "rsa",
 			.cra_driver_name = "tegra-se-pka1-rsa",
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
 			.cra_blocksize = MAX_PKA1_SIZE,
+#else
+			.cra_blocksize = MAX_ALGAPI_BLOCKSIZE,
+#endif
 			.cra_ctxsize = sizeof(struct tegra_se_pka1_rsa_context),
 			.cra_alignmask = 0,
 			.cra_module = THIS_MODULE,
@@ -4109,10 +4112,10 @@ static int tegra_se_ecdsa_sign(struct akcipher_request *req)
 	int nbytes = curve->nbytes;
 	int nwords = nbytes / WORD_SIZE_BYTES;
 	unsigned int ndigits = nwords / 2;
-	u64 z[ndigits], d[ndigits];
-	u64 k[ndigits], k_inv[ndigits];
-	u64 r[ndigits], s[ndigits];
-	u64 dr[ndigits], zdr[ndigits];
+	u64 z[ECC_MAX_DIGITS], d[ECC_MAX_DIGITS];
+	u64 k[ECC_MAX_DIGITS], k_inv[ECC_MAX_DIGITS];
+	u64 r[ECC_MAX_DIGITS], s[ECC_MAX_DIGITS];
+	u64 dr[ECC_MAX_DIGITS], zdr[ECC_MAX_DIGITS];
 	u8 *r_ptr, *s_ptr;
 	int ret = -ENOMEM;
 	int mod_op_mode;
@@ -4207,9 +4210,9 @@ static int tegra_se_ecdsa_verify(struct akcipher_request *req)
 	unsigned int nwords = nbytes / WORD_SIZE_BYTES;
 	unsigned int ndigits = nwords / 2;
 	u64 *ctx_qx, *ctx_qy;
-	u64 r[ndigits], s[ndigits], v[ndigits];
-	u64 z[ndigits], w[ndigits];
-	u64 u1[ndigits], u2[ndigits];
+	u64 r[ECC_MAX_DIGITS], s[ECC_MAX_DIGITS], v[ECC_MAX_DIGITS];
+	u64 z[ECC_MAX_DIGITS], w[ECC_MAX_DIGITS];
+	u64 u1[ECC_MAX_DIGITS], u2[ECC_MAX_DIGITS];
 	int mod_op_mode;
 	int ret = -ENOMEM;
 
@@ -4541,8 +4544,6 @@ static int tegra_se_elp_probe(struct platform_device *pdev)
 		goto clk_dis;
 	}
 
-	mutex_init(&se_dev->hw_lock);
-
 	err = crypto_register_kpp(&ecdh_algs[0]);
 	if (err) {
 		dev_err(se_dev->dev, "crypto_register_kpp ecdh failed\n");
@@ -4576,6 +4577,7 @@ static int tegra_se_elp_probe(struct platform_device *pdev)
 			goto rng_fail;
 		}
 	}
+	mutex_init(&se_dev->hw_lock);
 
 	err = crypto_register_akcipher(&ecdsa_alg);
 	if (err) {

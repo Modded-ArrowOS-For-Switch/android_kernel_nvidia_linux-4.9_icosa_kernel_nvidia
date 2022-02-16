@@ -3,7 +3,7 @@
  *
  * Tegra Graphics Host Channel
  *
- * Copyright (c) 2010-2018, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2010-2020, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -18,8 +18,6 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <linux/iommu.h>
-
 #include "bus_client_t186.h"
 #include "nvhost_channel.h"
 #include "dev.h"
@@ -31,12 +29,14 @@
 #include <linux/version.h>
 #include "nvhost_sync.h"
 
-#include <linux/platform/tegra/tegra-mc-sid.h>
-
 #include "nvhost_intr.h"
 #include "nvhost_vm.h"
 #include "class_ids.h"
 #include "debug.h"
+#if KERNEL_VERSION(4, 15, 0) > LINUX_VERSION_CODE
+#include <soc/tegra/chip-id.h>
+#endif
+#include <soc/tegra/fuse.h>
 
 #define MLOCK_TIMEOUT_MS (16)
 
@@ -91,38 +91,55 @@ static void serialize(struct nvhost_job *job)
 	}
 }
 
-#ifdef CONFIG_TEGRA_GRHOST_SYNC
+#if defined(CONFIG_TEGRA_GRHOST_SYNC)
+static int validate_syncpt_id_cb(struct nvhost_ctrl_sync_fence_info info,
+				 void *data)
+{
+	struct nvhost_syncpt *sp = data;
+
+	if (!nvhost_syncpt_is_valid_hw_pt(sp, info.id))
+		return -EINVAL;
+
+	return 0;
+}
+
+static int push_wait_cb(struct nvhost_ctrl_sync_fence_info info, void *data)
+{
+	struct nvhost_channel *ch = data;
+	struct nvhost_master *host = nvhost_get_host(ch->dev);
+	struct nvhost_syncpt *sp = &host->syncpt;
+
+	if (nvhost_syncpt_is_expired(sp, info.id, info.thresh))
+		return 0;
+
+	nvhost_cdma_push(&ch->cdma,
+		nvhost_opcode_setclass(NV_HOST1X_CLASS_ID,
+			host1x_uclass_load_syncpt_payload_32_r(), 1),
+			info.thresh);
+	nvhost_cdma_push(&ch->cdma,
+		nvhost_opcode_setclass(NV_HOST1X_CLASS_ID,
+			host1x_uclass_wait_syncpt_32_r(), 1),
+			info.id);
+
+	return 0;
+}
+
 static void add_sync_waits(struct nvhost_channel *ch, int fd)
 {
 	struct nvhost_master *host = nvhost_get_host(ch->dev);
 	struct nvhost_syncpt *sp = &host->syncpt;
-	struct sync_fence *fence;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,18,0)
-	struct list_head *pos;
-#else
-	int i;
-#endif
+	struct nvhost_fence *fence;
 
 	if (fd < 0)
 		return;
 
-	fence = nvhost_sync_fdget(fd);
+	fence = nvhost_fence_get(fd);
 	if (!fence)
 		return;
 
-	/* validate syncpt ids */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,18,0)
-	list_for_each(pos, &fence->pt_list_head) {
-		struct sync_pt *pt = container_of(pos, struct sync_pt, pt_list);
-#else
-	for (i = 0; i < fence->num_fences; i++) {
-		struct sync_pt *pt = sync_pt_from_fence(fence->cbs[i].sync_pt);
-#endif
-		u32 id = nvhost_sync_pt_id(pt);
-		if (!id || !nvhost_syncpt_is_valid_hw_pt(sp, id)) {
-			sync_fence_put(fence);
-			return;
-		}
+	if (nvhost_fence_foreach_pt(fence, validate_syncpt_id_cb, sp)) {
+		nvhost_fence_put(fence);
+		return;
 	}
 
 	/*
@@ -133,29 +150,9 @@ static void add_sync_waits(struct nvhost_channel *ch, int fd)
 	 * overwrite the RESTART opcode at the end of the push
 	 * buffer.
 	 */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,18,0)
-	list_for_each(pos, &fence->pt_list_head) {
-		struct sync_pt *pt = container_of(pos, struct sync_pt, pt_list);
-#else
-	for (i = 0; i < fence->num_fences; i++) {
-		struct sync_pt *pt = sync_pt_from_fence(fence->cbs[i].sync_pt);
-#endif
-		u32 id = nvhost_sync_pt_id(pt);
-		u32 thresh = nvhost_sync_pt_thresh(pt);
+	nvhost_fence_foreach_pt(fence, push_wait_cb, ch);
 
-		if (nvhost_syncpt_is_expired(sp, id, thresh))
-			continue;
-
-		nvhost_cdma_push(&ch->cdma,
-			nvhost_opcode_setclass(NV_HOST1X_CLASS_ID,
-				host1x_uclass_load_syncpt_payload_32_r(), 1),
-				thresh);
-		nvhost_cdma_push(&ch->cdma,
-			nvhost_opcode_setclass(NV_HOST1X_CLASS_ID,
-				host1x_uclass_wait_syncpt_32_r(), 1),
-				id);
-	}
-	sync_fence_put(fence);
+	nvhost_fence_put(fence);
 }
 #else
 static void add_sync_waits(struct nvhost_channel *ch, int fd)
@@ -208,20 +205,16 @@ static inline int get_streamid(struct nvhost_job *job)
 	struct platform_device *host_dev = nvhost_get_host(pdev)->dev;
 	int streamid;
 
-	/* set channel streamid */
-	if (job->ch->vm) {
-		/* if vm is defined, take vm specific */
-		streamid = nvhost_vm_get_id(job->ch->vm);
-	} else {
-		/* ..otherwise assume that the buffers are mapped to device
-		 * own address space */
-		streamid = iommu_get_hwid(pdev->dev.archdata.iommu,
-					  &pdev->dev,
-					  nvhost_host1x_get_vmid(host_dev));
-		if (streamid < 0)
-			streamid = tegra_mc_get_smmu_bypass_sid();
-	}
-	return streamid;
+	/* if vm is defined, take vm specific */
+	if (job->ch->vm)
+		return nvhost_vm_get_id(job->ch->vm);
+
+	/* attempt using the engine streamid */
+	streamid = nvhost_vm_get_hwid(pdev, nvhost_host1x_get_vmid(host_dev));
+	if (streamid >= 0)
+		return streamid;
+
+	return nvhost_vm_get_bypass_hwid();
 }
 
 static void submit_setstreamid(struct nvhost_job *job)
@@ -229,9 +222,6 @@ static void submit_setstreamid(struct nvhost_job *job)
 	struct nvhost_device_data *pdata = platform_get_drvdata(job->ch->dev);
 	int streamid = get_streamid(job);
 	int i;
-
-	if (!pdata->isolate_contexts)
-		return;
 
 	for (i = 0; i < ARRAY_SIZE(pdata->vm_regs); i++) {
 		if (!pdata->vm_regs[i].addr)
@@ -246,22 +236,45 @@ static void submit_setstreamid(struct nvhost_job *job)
 	}
 }
 
+#ifdef NVHOST_HAS_SUBMIT_HOST1XSTREAMID
+#include "host1x/submit_host1x_streamid.h"
+#endif
+
+static void submit_check_alignment(struct nvhost_cdma *cdma)
+{
+	/*
+	 * Ensure that there is always space for two contiguous slots after
+	 * the next pushed slot.
+	 *
+	 * This is used before a RELEASE_MLOCK slot to ensure that after
+	 * the RELEASE_MLOCK slot, there is contiguous space for the
+	 * following ACQUIRE_MLOCK-SETCLASS-SETPAYLOAD-SETSTREAMID
+	 * sequence.
+	 *
+	 * Otherwise we can get into a situation, where (there being
+	 * 16 bytes = 2 slots left in the pushbuffer before wraparound),
+	 * after the RELEASE_MLOCK there is only one slot, and the
+	 * successive ACQUIRE_MLOCK sequence will be split.
+	 */
+	if (cdma->push_buffer.cur == PUSH_BUFFER_SIZE-16)
+		nvhost_cdma_push(cdma, NVHOST_OPCODE_NOOP, NVHOST_OPCODE_NOOP);
+}
+
 static void submit_work(struct nvhost_job *job)
 {
 	struct nvhost_device_data *pdata = platform_get_drvdata(job->ch->dev);
-	bool use_locking =
-		pdata->resource_policy == RESOURCE_PER_CHANNEL_INSTANCE;
 	void *cpuva = NULL;
-	u32 cur_class = 0;
 	int i;
 
 	/* First, move us into host class */
-	if (use_locking) {
-		cur_class = NV_HOST1X_CLASS_ID;
-		nvhost_cdma_push(&job->ch->cdma,
-				 nvhost_opcode_acquire_mlock(cur_class),
-				 nvhost_opcode_setclass(cur_class, 0, 0));
-	}
+	u32 cur_class = NV_HOST1X_CLASS_ID;
+
+	nvhost_cdma_push(&job->ch->cdma,
+			 nvhost_opcode_acquire_mlock(cur_class),
+			 nvhost_opcode_setclass(cur_class, 0, 0));
+#ifdef NVHOST_HAS_SUBMIT_HOST1XSTREAMID
+	submit_host1xstreamid(job);
+#endif
 
 	/* make all waits in the beginning */
 	push_waits(job);
@@ -273,21 +286,25 @@ static void submit_work(struct nvhost_job *job)
 		u32 op2 = NVHOST_OPCODE_NOOP;
 
 		/* handle class changing */
-		if (!cur_class || cur_class != g->class_id) {
+		if (cur_class != g->class_id) {
+			submit_check_alignment(&job->ch->cdma);
+
 			/* first, release current class */
-			if (use_locking && cur_class)
-				nvhost_cdma_push(&job->ch->cdma,
+			nvhost_cdma_push(&job->ch->cdma,
 					NVHOST_OPCODE_NOOP,
 					nvhost_opcode_release_mlock(cur_class));
 
-			/* acquire lock of the new class */
-			if (use_locking) {
-				op1 = nvhost_opcode_acquire_mlock(g->class_id);
-				op2 = nvhost_opcode_setclass(g->class_id, 0, 0);
-			} else {
-				op1 = nvhost_opcode_setclass(g->class_id, 0, 0);
-			}
+			/* As per bug: 200406973, Host1x HW expects these
+			 * initial commands in sequence. Otherwise, Host1x HW
+			 * will raise an interrupt.
+			 * - Acquire Mlock
+			 * - SetClass
+			 * - SetStreamID in sequence.
+			 */
 
+			/* acquire lock of the new class */
+			op1 = nvhost_opcode_acquire_mlock(g->class_id);
+			op2 = nvhost_opcode_setclass(g->class_id, 0, 0);
 
 			/* ..and finally, push opcode pair to hardware */
 			nvhost_cdma_push(&job->ch->cdma, op1, op2);
@@ -296,6 +313,10 @@ static void submit_work(struct nvhost_job *job)
 			cur_class = g->class_id;
 			if (g->class_id != NV_HOST1X_CLASS_ID)
 				submit_setstreamid(job);
+#ifdef NVHOST_HAS_SUBMIT_HOST1XSTREAMID
+			else
+				submit_host1xstreamid(job);
+#endif
 
 			/* initialize class context */
 			if (cur_class != NV_HOST1X_CLASS_ID) {
@@ -330,9 +351,10 @@ static void submit_work(struct nvhost_job *job)
 	/* make final increment */
 	submit_work_done_increment(job);
 
+	submit_check_alignment(&job->ch->cdma);
+
 	/* release the engine */
-	if (use_locking && cur_class)
-		nvhost_cdma_push(&job->ch->cdma,
+	nvhost_cdma_push(&job->ch->cdma,
 			NVHOST_OPCODE_NOOP,
 			nvhost_opcode_release_mlock(cur_class));
 }
@@ -343,6 +365,23 @@ static void set_mlock_timeout(struct nvhost_channel *ch)
 	struct nvhost_master *host = nvhost_get_host(ch->dev);
 	struct nvhost_device_data *pdata = platform_get_drvdata(ch->dev);
 	struct nvhost_device_data *host_pdata = platform_get_drvdata(host->dev);
+
+	if (nvhost_dev_is_virtual(host->dev)) {
+		/*
+		 * On T186 and T194, per channel Mlock timeout is provided.
+		 * So Nvhost driver configures Mlock timeout counter.
+		 * On T234, per engine Mlock timeout is provided. And per engine
+		 * Mlock timeout counter register is in HOST1X COMMON page.
+		 * So Nvhost server configures Mlock timeout counter.
+		 */
+#if KERNEL_VERSION(4, 15, 0) > LINUX_VERSION_CODE
+		if (tegra_get_chipid() == TEGRA_CHIPID_TEGRA23) {
+#else
+		if (tegra_get_chip_id() == TEGRA234) {
+#endif
+			return;
+		}
+	}
 
 	/* set mlock timeout */
 	if (host->info.vmserver_owns_engines) {
@@ -410,15 +449,9 @@ static int host1x_channel_submit(struct nvhost_job *job)
 	}
 
 	/* get host1x streamid */
-	if (host_dev->dev.archdata.iommu) {
-		streamid = iommu_get_hwid(host_dev->dev.archdata.iommu,
-					  &host_dev->dev,
-					  nvhost_host1x_get_vmid(host_dev));
-		if (streamid < 0)
-			streamid = tegra_mc_get_smmu_bypass_sid();
-	} else {
-		streamid = tegra_mc_get_smmu_bypass_sid();
-	}
+	streamid = nvhost_vm_get_hwid(host_dev, nvhost_host1x_get_vmid(host_dev));
+	if (streamid < 0)
+		streamid = nvhost_vm_get_bypass_hwid();
 
 	/* set channel streamid */
 	host1x_channel_writel(ch, host1x_channel_smmu_streamid_r(), streamid);
@@ -441,10 +474,6 @@ static int host1x_channel_submit(struct nvhost_job *job)
 		/* create a valid max for client managed syncpoints */
 		if (nvhost_syncpt_client_managed(sp, job->sp[i].id)) {
 			u32 min = nvhost_syncpt_read(sp, job->sp[i].id);
-			if (min)
-				dev_warn(&job->ch->dev->dev,
-					"converting an active unmanaged syncpoint %d to managed\n",
-					job->sp[i].id);
 			nvhost_syncpt_set_max(sp, job->sp[i].id, min);
 			nvhost_syncpt_set_manager(sp, job->sp[i].id, false);
 		}
@@ -494,15 +523,17 @@ error:
 static int host1x_channel_init_security(struct platform_device *pdev,
 	struct nvhost_channel *ch)
 {
-	u32 val;
+	u32 val = 0U;
 
-	val = host1x_hypervisor_readl(pdev,
-				      host1x_channel_filter_gbuffer_r() +
-				      BIT_WORD(ch->chid) * sizeof(u32));
-	host1x_hypervisor_writel(pdev,
-				 host1x_channel_filter_gbuffer_r() +
-				 BIT_WORD(ch->chid) * sizeof(u32),
-				 val | BIT_MASK(ch->chid));
+	if (nvhost_dev_is_virtual(pdev) == false) {
+		val = host1x_hypervisor_readl(pdev,
+					host1x_channel_filter_gbuffer_r() +
+					BIT_WORD(ch->chid) * sizeof(u32));
+		host1x_hypervisor_writel(pdev,
+					 host1x_channel_filter_gbuffer_r() +
+					 BIT_WORD(ch->chid) * sizeof(u32),
+					 val | BIT_MASK(ch->chid));
+	}
 
 	return 0;
 }
@@ -512,10 +543,12 @@ static int host1x_channel_init(struct nvhost_channel *ch,
 {
 	ch->aperture = host1x_channel_aperture(dev->aperture, ch->chid);
 
-	/* move channel to VM */
-	host1x_hypervisor_writel(dev->dev,
-			(host1x_channel_ch_vm_0_r() + ch->chid * 4),
-			nvhost_host1x_get_vmid(dev->dev));
+	if (nvhost_dev_is_virtual(dev->dev) == false) {
+		/* move channel to VM */
+		host1x_hypervisor_writel(dev->dev,
+				(host1x_channel_ch_vm_0_r() + ch->chid * 4),
+				nvhost_host1x_get_vmid(dev->dev));
+	}
 
 	return 0;
 }

@@ -1,7 +1,7 @@
 /*
  * drivers/misc/tegra-cec/tegra_cec.c
  *
- * Copyright (c) 2012-2018, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2012-2020, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -39,7 +39,9 @@
 #include <linux/clk/tegra.h>
 #include <linux/of.h>
 
+#if defined(CONFIG_TEGRA_POWERGATE)
 #include <soc/tegra/tegra_powergate.h>
+#endif
 #include "tegra_cec.h"
 
 #include "dc.h"
@@ -339,6 +341,36 @@ static int tegra_cec_dump_registers(struct tegra_cec *cec)
 
 }
 
+static int tegra_cec_unpowergate(struct tegra_cec *cec)
+{
+	int ret = 0;
+
+	if (!tegra_dc_is_nvdisplay())
+		return 0;
+
+#if defined(CONFIG_TEGRA_POWERGATE)
+	ret = tegra_unpowergate_partition(cec->soc->powergate_id);
+#else
+	ret = pm_runtime_get(cec->dev);
+#endif
+	if (IS_ERR(ERR_PTR(ret)))
+		dev_err(cec->dev, "Failed to unpowergate DISP,err = %d\n", ret);
+
+	return ret;
+}
+
+static void tegra_cec_powergate(struct tegra_cec *cec)
+{
+	if (!tegra_dc_is_nvdisplay())
+		return;
+
+#if defined(CONFIG_TEGRA_POWERGATE)
+	tegra_powergate_partition(cec->soc->powergate_id);
+#else
+	pm_runtime_put(cec->dev);
+#endif
+}
+
 static int tegra_cec_set_rx_snoop(struct tegra_cec *cec, u32 enable)
 {
 	u32 state;
@@ -361,6 +393,19 @@ static int tegra_cec_get_rx_snoop(struct tegra_cec *cec, u32 *state)
 	return 0;
 }
 
+static int tegra_cec_access_ok(bool write, unsigned long arg, size_t size)
+{
+	int err = 0;
+
+#if KERNEL_VERSION(5, 4, 0) > LINUX_VERSION_CODE
+	u8 __maybe_unused access_type = write ? VERIFY_WRITE : VERIFY_READ;
+	err = !access_ok(access_type, arg, size);
+#else
+	err = !access_ok((void *)arg, size);
+#endif
+
+	return err;
+}
 
 static long tegra_cec_ioctl(struct file *file, unsigned int cmd,
 		 unsigned long arg)
@@ -383,7 +428,7 @@ static long tegra_cec_ioctl(struct file *file, unsigned int cmd,
 		tegra_cec_dump_registers(cec);
 		break;
 	case TEGRA_CEC_IOCTL_SET_RX_SNOOP:
-		err = !access_ok(VERIFY_READ, arg, sizeof(u32));
+		err = tegra_cec_access_ok(false, arg, sizeof(u32));
 		if (err)
 			return -EFAULT;
 		if (copy_from_user((u32 *) &state, (u32 *) arg, sizeof(u32)))
@@ -391,7 +436,7 @@ static long tegra_cec_ioctl(struct file *file, unsigned int cmd,
 		tegra_cec_set_rx_snoop(cec, state);
 		break;
 	case TEGRA_CEC_IOCTL_GET_RX_SNOOP:
-		err = !access_ok(VERIFY_WRITE, arg, sizeof(u32));
+		err = tegra_cec_access_ok(true, arg, sizeof(u32));
 		if (err)
 			return -EFAULT;
 		err = tegra_cec_get_rx_snoop(cec, &state);
@@ -401,7 +446,7 @@ static long tegra_cec_ioctl(struct file *file, unsigned int cmd,
 		}
 		break;
 	case TEGRA_CEC_IOCTL_GET_POST_RECOVERY:
-		err = !access_ok(VERIFY_WRITE, arg, sizeof(u32));
+		err = tegra_cec_access_ok(true, arg, sizeof(u32));
 		if (err)
 			return -EFAULT;
 		if (copy_to_user((bool *) arg, &post_recovery, sizeof(bool)))
@@ -630,7 +675,7 @@ static int tegra_cec_probe(struct platform_device *pdev)
 		goto cec_error;
 	}
 
-	cec->cec_base = devm_ioremap_nocache(&pdev->dev, res->start,
+	cec->cec_base = devm_ioremap(&pdev->dev, res->start,
 		resource_size(res));
 
 	if (!cec->cec_base) {
@@ -647,18 +692,17 @@ static int tegra_cec_probe(struct platform_device *pdev)
 	atomic_set(&cec->init_done, 0);
 	mutex_init(&cec->tx_lock);
 	mutex_init(&cec->recovery_lock);
+	cec->dev = &pdev->dev;
 
-#if defined(CONFIG_TEGRA_POWERGATE)
-	if (tegra_dc_is_nvdisplay()) {
-		ret = tegra_unpowergate_partition(cec->soc->powergate_id);
-		if (ret) {
-			dev_err(&pdev->dev, "Fail to unpowergate DISP: %d.\n",
-				ret);
-			goto clk_error;
-		}
-		dev_info(&pdev->dev, "Unpowergate DISP: %d.\n", ret);
-	}
+#if !defined(CONFIG_TEGRA_POWERGATE)
+	if (tegra_dc_is_nvdisplay())
+		pm_runtime_enable(&pdev->dev);
 #endif
+
+	ret = tegra_cec_unpowergate(cec);
+	if (IS_ERR(ERR_PTR(ret)))
+		goto clk_error;
+	dev_info(&pdev->dev, "Unpowergated DISP\n");
 
 	if (tegra_dc_is_nvdisplay()) {
 		if (np)
@@ -677,7 +721,6 @@ static int tegra_cec_probe(struct platform_device *pdev)
 	dev_info(&pdev->dev, "Enable clock result: %d.\n", ret);
 
 	/* set context info. */
-	cec->dev = &pdev->dev;
 	init_waitqueue_head(&cec->rx_waitq);
 	init_waitqueue_head(&cec->tx_waitq);
 	init_waitqueue_head(&cec->init_waitq);
@@ -742,10 +785,7 @@ cec_error:
 	cancel_work_sync(&cec->work);
 	clk_disable(cec->clk);
 	clk_put(cec->clk);
-#if defined(CONFIG_TEGRA_POWERGATE)
-	if (tegra_dc_is_nvdisplay())
-		tegra_powergate_partition(cec->soc->powergate_id);
-#endif
+	tegra_cec_powergate(cec);
 clk_error:
 	return ret;
 }
@@ -756,11 +796,11 @@ static int tegra_cec_remove(struct platform_device *pdev)
 
 	clk_disable(cec->clk);
 	clk_put(cec->clk);
-#if defined(CONFIG_TEGRA_POWERGATE)
+	tegra_cec_powergate(cec);
+#if !defined(CONFIG_TEGRA_POWERGATE)
 	if (tegra_dc_is_nvdisplay())
-		tegra_powergate_partition(cec->soc->powergate_id);
+		pm_runtime_disable(&pdev->dev);
 #endif
-
 	misc_deregister(&cec->misc_dev);
 	cancel_work_sync(&cec->work);
 
@@ -784,10 +824,7 @@ static int tegra_cec_suspend(struct platform_device *pdev, pm_message_t state)
 	atomic_set(&cec->init_cancel, 0);
 
 	clk_disable(cec->clk);
-#if defined(CONFIG_TEGRA_POWERGATE)
-	if (tegra_dc_is_nvdisplay())
-		tegra_powergate_partition(cec->soc->powergate_id);
-#endif
+	tegra_cec_powergate(cec);
 
 	dev_notice(&pdev->dev, "suspended\n");
 	return 0;
@@ -799,10 +836,7 @@ static int tegra_cec_resume(struct platform_device *pdev)
 
 	dev_notice(&pdev->dev, "Resuming\n");
 
-#if defined(CONFIG_TEGRA_POWERGATE)
-	if (tegra_dc_is_nvdisplay())
-		tegra_unpowergate_partition(cec->soc->powergate_id);
-#endif
+	tegra_cec_unpowergate(cec);
 	clk_enable(cec->clk);
 	schedule_work(&cec->work);
 
@@ -822,15 +856,21 @@ static int __init check_post_recovery(char *options)
 early_param("post_recovery", check_post_recovery);
 
 static struct tegra_cec_soc tegra210_soc_data = {
+#if defined(CONFIG_TEGRA_POWERGATE)
 	.powergate_id = TEGRA210_POWER_DOMAIN_DISA,
+#endif
 };
 
 static struct tegra_cec_soc tegra186_soc_data = {
+#if defined(CONFIG_TEGRA_POWERGATE)
 	.powergate_id = TEGRA186_POWER_DOMAIN_DISP,
+#endif
 };
 
 static struct tegra_cec_soc tegra194_soc_data = {
+#if defined(CONFIG_TEGRA_POWERGATE)
 	.powergate_id = TEGRA194_POWER_DOMAIN_DISP,
+#endif
 };
 
 static struct of_device_id tegra_cec_of_match[] = {

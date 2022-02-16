@@ -30,10 +30,7 @@ struct ucode_bin_header_v1_flcn {
 	u32 os_bin_header_offset;
 	u32 os_bin_data_offset;
 	u32 os_bin_size;
-	u32 fce_bin_header_offset;
-	u32 fce_bin_data_offset;
-	u32 fce_bin_size;
-	u32 bin_ver_tag;
+	u32 reserved[4];
 };
 
 struct ucode_os_header_v1_flcn {
@@ -44,16 +41,9 @@ struct ucode_os_header_v1_flcn {
 	u32 num_apps;
 };
 
-struct ucode_fce_header_v1_flcn {
-	u32 fce_ucode_offset;
-	u32 fce_ucode_buffer_size;
-	u32 fce_ucode_size;
-};
-
 struct ucode_v1_flcn {
 	struct ucode_bin_header_v1_flcn *bin_header;
 	struct ucode_os_header_v1_flcn  *os_header;
-	struct ucode_fce_header_v1_flcn *fce_header;
 	bool valid;
 };
 
@@ -66,7 +56,7 @@ struct flcn_os_image {
 	u32 code_size;
 	u32 code_offset;
 	u32 size;
-	u32 bin_ver_tag;
+	u32 reserved;
 };
 
 struct flcn {
@@ -79,9 +69,6 @@ struct flcn {
 
 	dma_addr_t dma_addr;
 	u32 *mapped;
-
-	dma_addr_t fce_dma_addr;
-	u32 *fce_mapped;
 };
 
 static inline struct flcn *get_flcn(struct platform_device *dev)
@@ -97,6 +84,8 @@ int flcn_setup_ucode_image(struct platform_device *dev,
 			   const struct firmware *ucode_fw,
 			   struct ucode_v1_flcn *ucode);
 int nvhost_vic_prepare_poweroff(struct platform_device *);
+void flcn_enable_thi_sec(struct platform_device *);
+int nvhost_flcn_finalize_poweron_t186(struct platform_device *);
 int nvhost_flcn_finalize_poweron(struct platform_device *);
 int nvhost_vic_finalize_poweron(struct platform_device *);
 int nvhost_vic_init_context(struct platform_device *pdev,

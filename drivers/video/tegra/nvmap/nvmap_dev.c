@@ -3,7 +3,7 @@
  *
  * User-space interface to nvmap
  *
- * Copyright (c) 2011-2020, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2011-2021, NVIDIA CORPORATION. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -36,7 +36,6 @@
 #include <linux/stat.h>
 #include <linux/kthread.h>
 #include <linux/highmem.h>
-#include <linux/lzo.h>
 #include <linux/swap.h>
 #include <linux/swapops.h>
 #include <linux/of.h>
@@ -47,10 +46,7 @@
 #include <linux/sched/mm.h>
 #endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
 #include <linux/backing-dev.h>
-#endif
-
 #include <asm/cputype.h>
 
 #define CREATE_TRACE_POINTS
@@ -58,6 +54,10 @@
 
 #include "nvmap_priv.h"
 #include "nvmap_ioctl.h"
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
+#include <linux/pagewalk.h>
+#endif
 
 #define NVMAP_CARVEOUT_KILLER_RETRY_TIME 100 /* msecs */
 
@@ -73,7 +73,7 @@ static int nvmap_open(struct inode *inode, struct file *filp);
 static int nvmap_release(struct inode *inode, struct file *filp);
 static long nvmap_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 static int nvmap_map(struct file *filp, struct vm_area_struct *vma);
-#if !defined(CONFIG_MMU) && (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0))
+#if !defined(CONFIG_MMU)
 static unsigned nvmap_mmap_capabilities(struct file *filp);
 #endif
 
@@ -86,7 +86,7 @@ static const struct file_operations nvmap_user_fops = {
 	.compat_ioctl = nvmap_ioctl,
 #endif
 	.mmap		= nvmap_map,
-#if !defined(CONFIG_MMU) && (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0))
+#if !defined(CONFIG_MMU)
 	.mmap_capabilities = nvmap_mmap_capabilities,
 #endif
 };
@@ -320,9 +320,9 @@ static long nvmap_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		return -ENOTTY;
 
 	if (_IOC_DIR(cmd) & _IOC_READ)
-		err = !access_ok(VERIFY_WRITE, uarg, _IOC_SIZE(cmd));
+		err = !ACCESS_OK(VERIFY_WRITE, uarg, _IOC_SIZE(cmd));
 	if (!err && (_IOC_DIR(cmd) & _IOC_WRITE))
-		err = !access_ok(VERIFY_READ, uarg, _IOC_SIZE(cmd));
+		err = !ACCESS_OK(VERIFY_READ, uarg, _IOC_SIZE(cmd));
 
 	if (err)
 		return -EFAULT;
@@ -386,12 +386,6 @@ static long nvmap_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			sizeof(struct nvmap_rw_handle));
 		break;
 
-	case NVMAP_IOC_WRITE_64:
-	case NVMAP_IOC_READ_64:
-		err = nvmap_ioctl_rw_handle(filp, cmd == NVMAP_IOC_READ_64,
-			uarg, sizeof(struct nvmap_rw_handle_64));
-		break;
-
 #ifdef CONFIG_COMPAT
 	case NVMAP_IOC_CACHE_32:
 		err = nvmap_ioctl_cache_maint(filp, uarg,
@@ -410,9 +404,7 @@ static long nvmap_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		break;
 
 	case NVMAP_IOC_CACHE_LIST:
-	case NVMAP_IOC_RESERVE:
-		err = nvmap_ioctl_cache_maint_list(filp, uarg,
-						   cmd == NVMAP_IOC_RESERVE);
+		err = nvmap_ioctl_cache_maint_list(filp, uarg);
 		break;
 
 	case NVMAP_IOC_GUP_TEST:
@@ -469,12 +461,20 @@ static long nvmap_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		err = nvmap_ioctl_get_heap_size(filp, uarg);
 		break;
 
-	case NVMAP_IOC_QUERY_HEAP_PARAMS:
-		err = nvmap_ioctl_query_heap_params(filp, uarg);
+	case NVMAP_IOC_PARAMETERS:
+		err = nvmap_ioctl_get_handle_parameters(filp, uarg);
 		break;
 
-	case NVMAP_IOC_PARAMETERS:
-		err = nvmap_ioctl_query_handle_parameters(filp, uarg);
+	case NVMAP_IOC_GET_SCIIPCID:
+		err = nvmap_ioctl_get_sci_ipc_id(filp, uarg);
+		break;
+
+	case NVMAP_IOC_HANDLE_FROM_SCIIPCID:
+		err = nvmap_ioctl_handle_from_sci_ipc_id(filp, uarg);
+		break;
+
+	case NVMAP_IOC_QUERY_HEAP_PARAMS:
+		err = nvmap_ioctl_query_heap_params(filp, uarg);
 		break;
 
 	default:
@@ -577,6 +577,21 @@ next_page:
 	}
 	mutex_unlock(&dev->tags_lock);
 	nvmap_ref_unlock(client);
+}
+
+bool is_nvmap_memory_available(size_t size)
+{
+	unsigned long total_num_pages =
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+		totalram_pages();
+#else
+		totalram_pages;
+#endif
+	if ((size >> PAGE_SHIFT) > total_num_pages) {
+		pr_debug("Requested allocation size is more than system memory");
+		return false;
+	}
+	return true;
 }
 
 /* compute the total amount of handle physical memory that is mapped
@@ -1047,6 +1062,7 @@ static int nvmap_debug_lru_allocations_show(struct seq_file *s, void *unused)
 
 DEBUGFS_OPEN_FOPS(lru_allocations);
 
+#ifdef NVMAP_PROCRANK
 struct procrank_stats {
 	struct vm_area_struct *vma;
 	u64 pss;
@@ -1085,6 +1101,7 @@ static int procrank_pte_entry(pte_t *pte, unsigned long addr, unsigned long end,
 #define PTRACE_MODE_READ_FSCREDS PTRACE_MODE_READ
 #endif
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
 static void nvmap_iovmm_get_client_mss(struct nvmap_client *client, u64 *pss,
 				   u64 *total)
 {
@@ -1104,7 +1121,7 @@ static void nvmap_iovmm_get_client_mss(struct nvmap_client *client, u64 *pss,
 			PTRACE_MODE_READ_FSCREDS);
 	if (!mm || IS_ERR(mm)) return;
 
-	down_read(&mm->mmap_sem);
+	nvmap_acquire_mmap_read_lock(mm);
 	procrank_walk.mm = mm;
 
 	nvmap_ref_lock(client);
@@ -1130,11 +1147,68 @@ static void nvmap_iovmm_get_client_mss(struct nvmap_client *client, u64 *pss,
 		*total += h->size / atomic_read(&h->share_count);
 	}
 
-	up_read(&mm->mmap_sem);
+	nvmap_release_mmap_read_lock(mm);
 	mmput(mm);
 	*pss = (mss.pss >> PSS_SHIFT);
 	nvmap_ref_unlock(client);
 }
+#else
+static void nvmap_iovmm_get_client_mss(struct nvmap_client *client, u64 *pss,
+				   u64 *total)
+{
+	struct mm_walk_ops wk_ops = {
+		.pte_entry = procrank_pte_entry,
+	};
+	struct rb_node *n;
+	struct nvmap_vma_list *tmp;
+	struct procrank_stats mss;
+	struct mm_walk procrank_walk = {
+		.ops = &wk_ops,
+		.private = &mss,
+	};
+	struct mm_struct *mm;
+
+	memset(&mss, 0, sizeof(mss));
+	*pss = *total = 0;
+
+	mm = mm_access(client->task,
+			PTRACE_MODE_READ_FSCREDS);
+	if (!mm || IS_ERR(mm)) return;
+
+	nvmap_acquire_mmap_read_lock(mm);
+	procrank_walk.mm = mm;
+
+	nvmap_ref_lock(client);
+	n = rb_first(&client->handle_refs);
+	for (; n != NULL; n = rb_next(n)) {
+		struct nvmap_handle_ref *ref =
+			rb_entry(n, struct nvmap_handle_ref, node);
+		struct nvmap_handle *h = ref->handle;
+
+		if (!h || !h->alloc || !h->heap_pgalloc)
+			continue;
+
+		mutex_lock(&h->lock);
+		list_for_each_entry(tmp, &h->vmas, list) {
+			if (client->task->pid == tmp->pid) {
+				mss.vma = tmp->vma;
+					walk_page_range(procrank_walk.mm,
+						tmp->vma->vm_start,
+						tmp->vma->vm_end,
+						procrank_walk.ops,
+						procrank_walk.private);
+			}
+		}
+		mutex_unlock(&h->lock);
+		*total += h->size / atomic_read(&h->share_count);
+	}
+
+	nvmap_release_mmap_read_lock(mm);
+	mmput(mm);
+	*pss = (mss.pss >> PSS_SHIFT);
+	nvmap_ref_unlock(client);
+}
+#endif
 
 static int nvmap_debug_iovmm_procrank_show(struct seq_file *s, void *unused)
 {
@@ -1160,6 +1234,7 @@ static int nvmap_debug_iovmm_procrank_show(struct seq_file *s, void *unused)
 }
 
 DEBUGFS_OPEN_FOPS(iovmm_procrank);
+#endif /* NVMAP_PROCRANK */
 
 ulong nvmap_iovmm_get_used_pages(void)
 {
@@ -1190,10 +1265,31 @@ static void nvmap_iovmm_debugfs_init(void)
 			debugfs_create_file("maps", S_IRUGO, iovmm_root,
 				(void *)(uintptr_t)NVMAP_HEAP_IOVMM,
 				&debug_maps_fops);
+#ifdef NVMAP_PROCRANK
 			debugfs_create_file("procrank", S_IRUGO, iovmm_root,
 				nvmap_dev, &debug_iovmm_procrank_fops);
+#endif
 		}
 	}
+}
+
+static bool nvmap_is_iommu_present(void)
+{
+	struct device_node *np;
+	struct property *prop;
+
+	np = of_find_node_by_name(NULL, "iommu");
+	while (np) {
+		prop = of_find_property(np, "status", NULL);
+		if (prop && !strcmp(prop->value, "okay")) {
+			of_node_put(np);
+			return true;
+		}
+		of_node_put(np);
+		np = of_find_node_by_name(np, "iommu");
+	}
+
+	return false;
 }
 
 int __init nvmap_probe(struct platform_device *pdev)
@@ -1212,7 +1308,7 @@ int __init nvmap_probe(struct platform_device *pdev)
 		goto finish;
 	}
 
-	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+	dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
 	if (!dev) {
 		dev_err(&pdev->dev, "out of memory for device\n");
 		e = -ENOMEM;
@@ -1220,15 +1316,19 @@ int __init nvmap_probe(struct platform_device *pdev)
 	}
 
 	nvmap_init(pdev);
+
 	plat = pdev->dev.platform_data;
+#ifndef NVMAP_LOADABLE_MODULE
 	if (!plat) {
 		dev_err(&pdev->dev, "no platform data?\n");
 		e = -ENODEV;
-		goto free_dev;
+		goto finish;
 	}
+#endif /* !NVMAP_LOADABLE_MODULE */
 
 	nvmap_dev = dev;
 	nvmap_dev->plat = plat;
+
 	/*
 	 * dma_parms need to be set with desired max_segment_size to avoid
 	 * DMA map API returning multiple IOVA's for the buffer size > 64KB.
@@ -1240,11 +1340,6 @@ int __init nvmap_probe(struct platform_device *pdev)
 	dev->dev_user.parent = &pdev->dev;
 	dev->handles = RB_ROOT;
 
-	if (of_property_read_bool(pdev->dev.of_node,
-				"no-cache-maint-by-set-ways"))
-		nvmap_cache_maint_by_set_ways = 0;
-
-	nvmap_override_cache_ops();
 #ifdef CONFIG_NVMAP_PAGE_POOLS
 	e = nvmap_page_pool_init(dev);
 	if (e)
@@ -1259,6 +1354,7 @@ int __init nvmap_probe(struct platform_device *pdev)
 	spin_lock_init(&dev->lru_lock);
 	dev->tags = RB_ROOT;
 	mutex_init(&dev->tags_lock);
+	mutex_init(&dev->carveout_lock);
 
 	e = misc_register(&dev->dev_user);
 	if (e) {
@@ -1277,9 +1373,9 @@ int __init nvmap_probe(struct platform_device *pdev)
 
 	nvmap_dev->dynamic_dma_map_mask = ~0;
 	nvmap_dev->cpu_access_mask = ~0;
-	for (i = 0; i < plat->nr_carveouts; i++)
-		(void)nvmap_create_carveout(&plat->carveouts[i]);
-
+	if (plat)
+		for (i = 0; i < plat->nr_carveouts; i++)
+			nvmap_create_carveout(&plat->carveouts[i]);
 	nvmap_iovmm_debugfs_init();
 #ifdef CONFIG_NVMAP_PAGE_POOLS
 	nvmap_page_pool_debugfs_init(nvmap_dev->debug_root);
@@ -1303,13 +1399,13 @@ int __init nvmap_probe(struct platform_device *pdev)
 			generic_carveout_present = 1;
 
 	if (generic_carveout_present) {
-		if (!iommu_present(&platform_bus_type))
+		if (!iommu_present(&platform_bus_type) &&
+			!nvmap_is_iommu_present())
 			nvmap_convert_iovmm_to_carveout = 1;
 		else if (!of_property_read_bool(pdev->dev.of_node,
 				"dont-convert-iovmm-to-carveout"))
 			nvmap_convert_iovmm_to_carveout = 1;
 	} else {
-		BUG_ON(!iommu_present(&platform_bus_type));
 		nvmap_convert_carveout_to_iovmm = 1;
 	}
 
@@ -1317,6 +1413,10 @@ int __init nvmap_probe(struct platform_device *pdev)
 	if (nvmap_convert_iovmm_to_carveout)
 		nvmap_page_pool_fini(dev);
 #endif
+
+	e = nvmap_sci_ipc_init();
+	if (e)
+		goto fail_heaps;
 
 	goto finish;
 fail_heaps:
@@ -1332,8 +1432,6 @@ fail:
 	if (dev->dev_user.minor != MISC_DYNAMIC_MINOR)
 		misc_deregister(&dev->dev_user);
 	nvmap_dev = NULL;
-free_dev:
-	kfree(dev);
 finish:
 	nvmap_init_time += sched_clock() - start_time;
 	return e;
@@ -1348,6 +1446,8 @@ int nvmap_remove(struct platform_device *pdev)
 
 	misc_deregister(&dev->dev_user);
 
+	nvmap_sci_ipc_exit();
+
 	while ((n = rb_first(&dev->handles))) {
 		h = rb_entry(n, struct nvmap_handle, node);
 		rb_erase(&h->node, &dev->handles);
@@ -1360,7 +1460,6 @@ int nvmap_remove(struct platform_device *pdev)
 	}
 	kfree(dev->heaps);
 
-	kfree(dev);
 	nvmap_dev = NULL;
 	return 0;
 }

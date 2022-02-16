@@ -1,7 +1,7 @@
 /*
  * tegra_wdt_t18x.c: watchdog driver for NVIDIA tegra internal watchdog
  *
- * Copyright (c) 2012-2019, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2012-2020, NVIDIA CORPORATION. All rights reserved.
  * Based on:
  *	drivers/watchdog/softdog.c and
  *	drivers/watchdog/omap_wdt.c
@@ -31,7 +31,12 @@
 #include <linux/syscore_ops.h>
 #include <linux/uaccess.h>
 #include <linux/watchdog.h>
+#include <linux/version.h>
+#if KERNEL_VERSION(4, 15, 0) > LINUX_VERSION_CODE
 #include <soc/tegra/chip-id.h>
+#else
+#include <soc/tegra/fuse.h>
+#endif
 #include <soc/tegra/pmc.h>
 
 /* The total expiry count of Tegra WDTs supported by HW */
@@ -304,6 +309,9 @@ static const struct watchdog_ops tegra_wdt_t18x_ops = {
 };
 
 #ifdef CONFIG_DEBUG_FS
+#define FILE_PERMISSIONS		644
+#define COUNTER_ENABLED			0x1
+
 static int dump_registers_show(struct seq_file *s, void *unused)
 {
 	struct tegra_wdt_t18x *twdt_t18x = s->private;
@@ -344,6 +352,28 @@ static int disable_por_reset_show(struct seq_file *s, void *unused)
 	return 0;
 }
 
+static int disable_wdt_show(void *data, u64 *val)
+{
+	struct tegra_wdt_t18x *twdt_t18x = data;
+	*val = (twdt_t18x->status & COUNTER_ENABLED) ? 0 : 1;
+	return 0;
+}
+
+static int disable_wdt_store(void *data, u64 val)
+{
+	struct tegra_wdt_t18x *twdt_t18x = data;
+
+	if (val) {
+		if (COUNTER_ENABLED & twdt_t18x->status)
+			__tegra_wdt_t18x_disable(twdt_t18x);
+	} else {
+		if (!(COUNTER_ENABLED & twdt_t18x->status))
+			__tegra_wdt_t18x_enable(twdt_t18x);
+	}
+
+	return 0;
+}
+
 #define SIMPLE_FOPS(_name, _show)					\
 static int dbg_open_##_name(struct inode *inode, struct file *file)	\
 {									\
@@ -359,6 +389,8 @@ static const struct file_operations _name##_fops = {			\
 SIMPLE_FOPS(dump_regs, dump_registers_show);
 SIMPLE_FOPS(disable_dbg_reset, disable_dbg_reset_show);
 SIMPLE_FOPS(disable_por_reset, disable_por_reset_show);
+DEFINE_SIMPLE_ATTRIBUTE(disable_wdt_fops, disable_wdt_show,
+	disable_wdt_store, "%lld\n");
 
 static void tegra_wdt_t18x_debugfs_init(struct tegra_wdt_t18x *twdt_t18x)
 {
@@ -370,20 +402,26 @@ static void tegra_wdt_t18x_debugfs_init(struct tegra_wdt_t18x *twdt_t18x)
 	if (IS_ERR_OR_NULL(root))
 		goto clean;
 
-	retval = debugfs_create_file("dump_regs", S_IRUGO | S_IWUSR,
+	retval = debugfs_create_file("dump_regs", FILE_PERMISSIONS,
 				     root, twdt_t18x, &dump_regs_fops);
 	if (IS_ERR_OR_NULL(retval))
 		goto clean;
 
-	retval = debugfs_create_file("disable_dbg_reset", S_IRUGO | S_IWUSR,
+	retval = debugfs_create_file("disable_dbg_reset", FILE_PERMISSIONS,
 				     root, twdt_t18x,
 				     &disable_dbg_reset_fops);
 	if (IS_ERR_OR_NULL(retval))
 		goto clean;
 
-	retval = debugfs_create_file("disable_por_reset", S_IRUGO | S_IWUSR,
+	retval = debugfs_create_file("disable_por_reset", FILE_PERMISSIONS,
 				     root, twdt_t18x,
 				     &disable_por_reset_fops);
+	if (IS_ERR_OR_NULL(retval))
+		goto clean;
+
+	retval = debugfs_create_file("disable_wdt", FILE_PERMISSIONS,
+					root, twdt_t18x,
+					&disable_wdt_fops);
 	if (IS_ERR_OR_NULL(retval))
 		goto clean;
 

@@ -34,25 +34,20 @@ static void intr_enable_syncpt_intr(struct nvhost_intr *intr, u32 id);
 static void intr_set_syncpt_threshold(struct nvhost_intr *intr,
 					  u32 id, u32 thresh);
 
-static irqreturn_t syncpt_thresh_cascade_isr(int irq, void *dev_id)
+static irqreturn_t syncpt_thresh_cascade_isr(int irq, void *syncpt_irq_ctx)
 {
-	struct nvhost_master *dev = dev_id;
+	struct nvhost_syncpt_irq_ctx *ctx = syncpt_irq_ctx;
+	struct nvhost_master *dev = ctx->dev;
 	struct nvhost_intr *intr = &dev->intr;
 	unsigned long reg;
-	int i, id, err;
+	int i, id;
 	struct nvhost_timespec isr_recv;
+	int start_reg = ctx->start_id / 32;
+	int end_reg = DIV_ROUND_UP((ctx->end_id + 1), 32);
 
 	nvhost_ktime_get_ts(&isr_recv);
 
-	/* make sure host1x is powered */
-	err = nvhost_module_busy(dev->dev);
-	if (err) {
-		WARN(1, "failed to powerON host1x.");
-		return IRQ_HANDLED;
-	}
-
-	for (i = 0; i < DIV_ROUND_UP(nvhost_syncpt_nb_hw_pts(&dev->syncpt), 32);
-			i++) {
+	for (i = start_reg; i < end_reg; i++) {
 		reg = host1x_readl(dev->dev,
 				host1x_sync_syncpt_thresh_cpu0_int_status_r() +
 				i * REGISTER_STRIDE);
@@ -63,13 +58,10 @@ static irqreturn_t syncpt_thresh_cascade_isr(int irq, void *dev_id)
 			int graphics_host_sp =
 				nvhost_syncpt_graphics_host_sp(&dev->syncpt);
 
-			if (unlikely(!nvhost_syncpt_is_valid_hw_pt(&dev->syncpt,
-					sp_id))) {
-				dev_err(&dev->dev->dev, "%s(): syncpoint id %d is beyond the number of syncpoints (%d)\n",
-					__func__, sp_id,
-					nvhost_syncpt_nb_hw_pts(&dev->syncpt));
+			if (sp_id < ctx->start_id)
+				continue;
+			if (sp_id > ctx->end_id)
 				goto out;
-			}
 
 			sp = intr->syncpt + sp_id;
 			sp->isr_recv = isr_recv;
@@ -90,12 +82,15 @@ static irqreturn_t syncpt_thresh_cascade_isr(int irq, void *dev_id)
 	}
 
 out:
-	nvhost_module_idle(dev->dev);
 	return IRQ_HANDLED;
 }
 
 static void intr_set_host_clocks_per_usec(struct nvhost_intr *intr, u32 cpm)
 {
+	struct nvhost_master *dev = intr_to_dev(intr);
+	/* program AXI timeout */
+	host1x_common_writel(dev->dev,
+			host1x_sync_ip_busy_timeout_r(), cpm * 10000);
 }
 
 static void intr_set_syncpt_threshold(struct nvhost_intr *intr,
@@ -267,9 +262,13 @@ static void intr_enable_host_irq(struct nvhost_intr *intr, int irq)
 	struct nvhost_master *dev = intr_to_dev(intr);
 	unsigned long val;
 
-	val = host1x_hypervisor_readl(dev->dev, host1x_sync_intmask_r());
-	val |= BIT(irq);
-	host1x_hypervisor_writel(dev->dev, host1x_sync_intmask_r(), val);
+	if (nvhost_dev_is_virtual(dev->dev) == false) {
+		val = host1x_hypervisor_readl(dev->dev,
+					      host1x_sync_intmask_r());
+		val |= BIT(irq);
+		host1x_hypervisor_writel(dev->dev, host1x_sync_intmask_r(),
+					 val);
+	}
 }
 
 static void intr_disable_host_irq(struct nvhost_intr *intr, int irq)
@@ -277,29 +276,13 @@ static void intr_disable_host_irq(struct nvhost_intr *intr, int irq)
 	struct nvhost_master *dev = intr_to_dev(intr);
 	unsigned long val;
 
-	val = host1x_hypervisor_readl(dev->dev, host1x_sync_intmask_r());
-	val &= ~BIT(irq);
-	host1x_hypervisor_writel(dev->dev, host1x_sync_intmask_r(), val);
-}
-
-static void intr_enable_module_intr(struct nvhost_intr *intr, int irq)
-{
-	struct nvhost_master *dev = intr_to_dev(intr);
-	unsigned long val;
-
-	val = host1x_hypervisor_readl(dev->dev, host1x_sync_intc0mask_r());
-	val |= BIT(irq);
-	host1x_hypervisor_writel(dev->dev, host1x_sync_intc0mask_r(), val);
-}
-
-static void intr_disable_module_intr(struct nvhost_intr *intr, int irq)
-{
-	struct nvhost_master *dev = intr_to_dev(intr);
-	unsigned long val;
-
-	val = host1x_hypervisor_readl(dev->dev, host1x_sync_intc0mask_r());
-	val &= ~BIT(irq);
-	host1x_hypervisor_writel(dev->dev, host1x_sync_intc0mask_r(), val);
+	if (nvhost_dev_is_virtual(dev->dev) == false) {
+		val = host1x_hypervisor_readl(dev->dev,
+					      host1x_sync_intmask_r());
+		val &= ~BIT(irq);
+		host1x_hypervisor_writel(dev->dev, host1x_sync_intmask_r(),
+					 val);
+	}
 }
 
 static int intr_debug_dump(struct nvhost_intr *intr, struct output *o)
@@ -330,12 +313,6 @@ static void intr_resume(struct nvhost_intr *intr)
 {
 	struct nvhost_master *dev = intr_to_dev(intr);
 
-	/* increase the auto-ack timout to the maximum value. 2d will hang
-	 * otherwise on ap20.
-	 */
-	host1x_hypervisor_writel(dev->dev,
-			host1x_sync_ctxsw_timeout_cfg_r(), 0xff);
-
 	/* enable graphics host syncpoint interrupt */
 	intr_set_syncpt_threshold(intr,
 			nvhost_syncpt_graphics_host_sp(&dev->syncpt),
@@ -343,29 +320,43 @@ static void intr_resume(struct nvhost_intr *intr)
 	intr_enable_syncpt_intr(intr,
 			nvhost_syncpt_graphics_host_sp(&dev->syncpt));
 
-	/* enable host module interrupt to CPU0 */
-	host1x_hypervisor_writel(dev->dev, host1x_sync_intc0mask_r(), BIT(0));
-	host1x_hypervisor_writel(dev->dev, host1x_sync_intgmask_r(), BIT(0));
-	/* enable syncpoint interrupts */
-	host1x_hypervisor_writel(dev->dev, host1x_sync_syncpt_intgmask_r(),
-				/* Camera CPUs 2 and 3 */
-				BIT(2) | BIT(3) |
-				/* VM1..VM8 */
-				(0xff << 8));
+	if (nvhost_dev_is_virtual(dev->dev) == false) {
+		/* increase the auto-ack timout to the maximum value. 2d will
+		 * hang otherwise on ap20.
+		 */
+		host1x_common_writel(dev->dev,
+				host1x_sync_ctxsw_timeout_cfg_r(), 0xff);
 
-	/* master enable for general (not syncpt) host interrupts
-	 * (AXIREAD, AXIWRITE, Syncpoint protection) */
-	host1x_hypervisor_writel(dev->dev, host1x_sync_intmask_r(),
-				 BIT(0) | BIT(1) | BIT(30) | BIT(28));
+		/* enable host module interrupt to CPU0 */
+		host1x_hypervisor_writel(dev->dev,
+					 host1x_sync_intc0mask_r(), BIT(0));
+		host1x_hypervisor_writel(dev->dev,
+					 host1x_sync_intgmask_r(), BIT(0));
+		/* enable syncpoint interrupts */
+		host1x_hypervisor_writel(dev->dev,
+					 host1x_sync_syncpt_intgmask_r(),
+					 /* Camera CPUs 2 and 3 */
+					 BIT(2) | BIT(3) |
+					 /* VM1..VM8 */
+					 (0xff << 8));
+
+		/* master enable for general (not syncpt) host interrupts
+		 * (AXIREAD, AXIWRITE, Syncpoint protection) */
+		host1x_hypervisor_writel(dev->dev, host1x_sync_intmask_r(),
+					 BIT(0) | BIT(1) | BIT(30) | BIT(28));
+	}
 }
 
 static void intr_suspend(struct nvhost_intr *intr)
 {
 	struct nvhost_master *dev = intr_to_dev(intr);
 
-	/* master disable for general (not syncpt) host interrupts */
-	host1x_hypervisor_writel(dev->dev, host1x_sync_intmask_r(), 0);
-	host1x_hypervisor_writel(dev->dev, host1x_sync_syncpt_intgmask_r(), 0);
+	if (nvhost_dev_is_virtual(dev->dev) == false) {
+		/* master disable for general (not syncpt) host interrupts */
+		host1x_hypervisor_writel(dev->dev, host1x_sync_intmask_r(), 0);
+		host1x_hypervisor_writel(dev->dev,
+					 host1x_sync_syncpt_intgmask_r(), 0);
+	}
 
 	/* disable graphics host syncpoint interrupt */
 	intr_disable_syncpt_intr(intr,
@@ -375,32 +366,45 @@ static void intr_suspend(struct nvhost_intr *intr)
 static int intr_init(struct nvhost_intr *intr)
 {
 	struct nvhost_master *dev = intr_to_dev(intr);
-	int err;
+	int nb_syncpt_irqs = nvhost_syncpt_nb_irqs(&dev->syncpt);
+	int err, i;
 
 	intr_op().disable_all_syncpt_intrs(intr);
 
-	err = request_threaded_irq(intr->syncpt_irq, NULL,
-				syncpt_thresh_cascade_isr,
-				IRQF_ONESHOT, "host_syncpt", dev);
-	if (err) {
-		nvhost_err(&dev->dev->dev,
+	for (i = 0; i < nb_syncpt_irqs; i++) {
+		err =  devm_request_threaded_irq(&dev->dev->dev,
+					intr->syncpt_irqs[i], NULL,
+					syncpt_thresh_cascade_isr,
+					IRQF_ONESHOT, "host_syncpt",
+					&intr->syncpt_irq_ctx[i]);
+		if (err) {
+			nvhost_err(&dev->dev->dev,
 			   "failed to request host_syncpt irq %u with err=%d",
-			   intr->syncpt_irq, err);
-		return err;
+			   intr->syncpt_irqs[i], err);
+			return err;
+		}
 	}
 
-	/* master disable for general (not syncpt) host interrupts */
-	host1x_hypervisor_writel(dev->dev, host1x_sync_intc0mask_r(), 0);
-	host1x_hypervisor_writel(dev->dev, host1x_sync_intgmask_r(), 0);
-	host1x_hypervisor_writel(dev->dev, host1x_sync_intmask_r(), 0);
+	if (nvhost_dev_is_virtual(dev->dev) == false) {
+		/* master disable for general (not syncpt) host interrupts */
+		host1x_hypervisor_writel(dev->dev,
+					 host1x_sync_intc0mask_r(), 0);
+		host1x_hypervisor_writel(dev->dev, host1x_sync_intgmask_r(), 0);
+		host1x_hypervisor_writel(dev->dev, host1x_sync_intmask_r(), 0);
 
-	if (!dev->info.vmserver_owns_engines) {
-		err = request_threaded_irq(intr->general_irq, NULL,
-					intr_host1x_isr,
-					IRQF_ONESHOT, "host_status", intr);
-		if (err)
-			dev_warn(&dev->dev->dev,
-			         "general irq request failed, but continuing\n");
+		if (!dev->info.vmserver_owns_engines) {
+			err = request_threaded_irq(intr->general_irq,
+						   NULL,
+						   intr_host1x_isr,
+						   IRQF_ONESHOT,
+						   "host_status",
+						   intr);
+			if (err) {
+				dev_warn(&dev->dev->dev,
+					 "general irq request failed, "
+					 "but continuing\n");
+			}
+		}
 	}
 
 	return 0;
@@ -413,7 +417,6 @@ static void intr_deinit(struct nvhost_intr *intr)
 	if (!dev->info.vmserver_owns_engines) {
 		free_irq(intr->general_irq, intr);
 	}
-	free_irq(intr->syncpt_irq, dev);
 }
 
 static const struct nvhost_intr_ops host1x_intr_ops = {
@@ -429,6 +432,4 @@ static const struct nvhost_intr_ops host1x_intr_ops = {
 	.debug_dump = intr_debug_dump,
 	.disable_host_irq = intr_disable_host_irq,
 	.enable_host_irq = intr_enable_host_irq,
-	.disable_module_intr = intr_disable_module_intr,
-	.enable_module_intr = intr_enable_module_intr,
 };

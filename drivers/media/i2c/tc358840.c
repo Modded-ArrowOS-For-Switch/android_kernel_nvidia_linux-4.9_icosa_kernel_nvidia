@@ -2,7 +2,7 @@
  * tc358840.c - Toshiba UH2C/D HDMI-CSI bridge driver
  *
  * Copyright (c) 2015, Armin Weiss <weii@zhaw.ch>
- * Copyright (c) 2016 - 2021, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2016-2021, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is based on the tc358840 - Toshiba HDMI to CSI-2 bridge driver
  * from Cisco Systems, Inc.
@@ -552,7 +552,11 @@ static void print_avi_infoframe(struct v4l2_subdev *sd)
 
 	i2c_rd(sd, PK_AVI_0HEAD, buffer, HDMI_INFOFRAME_SIZE(AVI));
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 	if (hdmi_infoframe_unpack(&frame, buffer) < 0) {
+#else
+	if (hdmi_infoframe_unpack(&frame, buffer, sizeof(buffer)) < 0) {
+#endif
 		v4l2_err(sd, "%s: unpack of AVI infoframe failed\n", __func__);
 		return;
 	}
@@ -1733,12 +1737,26 @@ static int tc358840_dv_timings_cap(struct v4l2_subdev *sd,
 	return 0;
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 static int tc358840_g_mbus_config(struct v4l2_subdev *sd,
 				  struct v4l2_mbus_config *cfg)
+#else
+static int tc358840_get_mbus_config(struct v4l2_subdev *sd,
+				unsigned int pad,
+                                struct v4l2_mbus_config *cfg)
+#endif
 {
 	v4l2_dbg(3, debug, sd, "%s():\n", __func__);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 	cfg->type = V4L2_MBUS_CSI2;
+#else
+	/*
+	 * TODO Bug 200664694: If the sensor type is CPHY
+	 *  then return an error
+	 */
+	cfg->type = V4L2_MBUS_CSI2_DPHY;
+#endif
 
 	/* Support for non-continuous CSI-2 clock is missing in the driver */
 	cfg->flags = V4L2_MBUS_CSI2_CONTINUOUS_CLOCK | V4L2_MBUS_CSI2_CHANNEL_0;
@@ -1993,7 +2011,9 @@ static struct v4l2_subdev_video_ops tc358840_subdev_video_ops = {
 	.s_dv_timings = tc358840_s_dv_timings,
 	.g_dv_timings = tc358840_g_dv_timings,
 	.query_dv_timings = tc358840_query_dv_timings,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 	.g_mbus_config = tc358840_g_mbus_config,
+#endif
 	.s_stream = tc358840_s_stream,
 };
 
@@ -2019,6 +2039,9 @@ static const struct v4l2_subdev_pad_ops tc358840_pad_ops = {
 	.enum_dv_timings = tc358840_enum_dv_timings,
 	.enum_frame_size = tc358840_enum_framesizes,
 	.enum_frame_interval = tc358840_enum_frameintervals,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+	.get_mbus_config = tc358840_get_mbus_config, 
+#endif
 };
 
 static struct v4l2_subdev_ops tc358840_ops = {
@@ -2407,11 +2430,7 @@ static int tc358840_probe(struct i2c_client *client, const struct i2c_device_id 
 #endif
 	i2c_wr16(sd, INTMASK, ~(MASK_HDMI_INT) & 0xFFFF);
 
-	err = v4l2_ctrl_handler_setup(sd->ctrl_handler);
-	if (err) {
-		v4l2_err(sd, "Could not setup handler!\n");
-		goto err_hdl;
-	}
+	v4l2_ctrl_handler_setup(sd->ctrl_handler);
 
 	v4l2_info(sd, "%s found @ 7h%02X (%s)\n", client->name,
 		  client->addr, client->adapter->name);

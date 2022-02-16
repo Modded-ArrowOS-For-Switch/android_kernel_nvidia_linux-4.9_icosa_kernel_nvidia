@@ -24,18 +24,18 @@
 #include <linux/slab.h>
 #include <linux/clk.h>
 #include <linux/clk/tegra.h>
-#include <soc/tegra/chip-id.h>
+#include <linux/version.h>
 #include <linux/pm_qos.h>
 #include <trace/events/nvhost.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
 #include <soc/tegra/tegra-dvfs.h>
 #include <linux/clk-provider.h>
-#endif
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
 #include <governor.h>
+#endif
 
 #include "dev.h"
 #include "debug.h"
@@ -43,6 +43,7 @@
 #include "nvhost_acm.h"
 #include "nvhost_scale.h"
 #include "host1x/host1x_actmon.h"
+#include "platform.h"
 
 static ssize_t nvhost_scale_load_show(struct device *dev,
 				      struct device_attribute *attr,
@@ -422,6 +423,7 @@ void nvhost_scale_init(struct platform_device *pdev)
 	/* initialize devfreq if governor is set and actmon enabled */
 	if (pdata->actmon_enabled && pdata->devfreq_governor) {
 		struct devfreq *devfreq;
+		int error = 0;
 
 		profile->devfreq_profile.initial_freq =
 			profile->devfreq_profile.freq_table[0];
@@ -446,6 +448,18 @@ void nvhost_scale_init(struct platform_device *pdev)
 		if (nvhost_module_add_client(pdev, devfreq)) {
 			nvhost_err(&pdev->dev,
 				"failed to register devfreq as acm client");
+		}
+
+		/* create symlink 'devfreq_dev' in nvhost dev. */
+		if (devfreq != NULL) {
+			error = sysfs_create_link(&pdev->dev.kobj,
+				&devfreq->dev.kobj, "devfreq_dev");
+
+			if (error) {
+				nvhost_err(&pdev->dev,
+					"Failed to create devfreq_dev: %d",
+					error);
+			}
 		}
 	}
 
@@ -482,8 +496,10 @@ void nvhost_scale_deinit(struct platform_device *pdev)
 	/* Remove devfreq from acm client list */
 	nvhost_module_remove_client(pdev, pdata->power_manager);
 
-	if (pdata->power_manager)
+	if (pdata->power_manager) {
 		devfreq_remove_device(pdata->power_manager);
+		sysfs_remove_link(&pdev->dev.kobj, "devfreq_dev");
+	}
 
 	if (pdata->actmon_enabled)
 		device_remove_file(&pdev->dev, &dev_attr_load);
@@ -679,11 +695,7 @@ static ssize_t actmon_sample_period_norm_write(struct file *file,
 	int buf_size;
 	unsigned long period;
 
-	if (count >= sizeof(buffer))
-		nvhost_warn(NULL, "%s: value too big!" \
-			"only first %ld characters will be written",
-			__func__, sizeof(buffer) - 1);
-
+	memset(buffer, 0, sizeof(buffer));
 	buf_size = min(count, (sizeof(buffer)-1));
 
 	if (copy_from_user(buffer, user_buf, buf_size)) {
@@ -691,7 +703,11 @@ static ssize_t actmon_sample_period_norm_write(struct file *file,
 			   user_buf);
 		return -EFAULT;
 	}
-	buffer[buf_size] = '\0';
+
+	if (strlen(buffer) > buf_size) {
+		nvhost_err(NULL, "buffer too large (>%d)", buf_size);
+		return -EFAULT;
+	}
 
 	if (kstrtoul(buffer, 10, &period)) {
 		nvhost_err(NULL, "failed to convert %s to ul", buffer);
@@ -700,7 +716,7 @@ static ssize_t actmon_sample_period_norm_write(struct file *file,
 
 	actmon_op().set_sample_period_norm(actmon, period);
 
-	return buf_size;
+	return count;
 }
 
 static const struct file_operations actmon_sample_period_norm_fops = {
@@ -754,11 +770,7 @@ static ssize_t actmon_k_write(struct file *file,
 	int buf_size;
 	unsigned long k;
 
-	if (count >= sizeof(buffer))
-		nvhost_warn(NULL, "%s: value too big!" \
-			"only first %ld characters will be written",
-			__func__, sizeof(buffer) - 1);
-
+	memset(buffer, 0, sizeof(buffer));
 	buf_size = min(count, (sizeof(buffer)-1));
 
 	if (copy_from_user(buffer, user_buf, buf_size)) {
@@ -767,7 +779,10 @@ static ssize_t actmon_k_write(struct file *file,
 		return -EFAULT;
 	}
 
-	buffer[buf_size] = '\0';
+	if (strlen(buffer) > buf_size) {
+		nvhost_err(NULL, "buffer too large (>%d)", buf_size);
+		return -EFAULT;
+	}
 
 	if (kstrtoul(buffer, 10, &k)) {
 		nvhost_err(NULL, "failed to convert %s to ul", buffer);

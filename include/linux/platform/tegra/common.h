@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2011-2019, NVIDIA Corporation. All rights reserved.
+ * Copyright (C) 2011-2020, NVIDIA Corporation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -40,7 +40,6 @@ extern int tegra_with_secure_firmware;
 
 extern struct device tegra_generic_dev;
 extern struct device tegra_vpr_dev;
-extern struct device tegra_iram_dev;
 extern struct dma_resize_notifier_ops vpr_dev_ops;
 
 u32 tegra_get_bct_strapping(void);
@@ -48,7 +47,7 @@ u32 tegra_get_fuse_opt_subrevision(void);
 enum tegra_revision tegra_chip_get_revision(void);
 void __init display_tegra_dt_info(void);
 
-bool tegra_is_vpr_resize_supported(void);
+bool tegra_is_vpr_resize_enabled(void);
 void tegra_register_idle_unidle(int (*do_idle)(void *),
 				int (*do_unidle)(void *),
 				void *data);

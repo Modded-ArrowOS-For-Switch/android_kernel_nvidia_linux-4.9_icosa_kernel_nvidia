@@ -1,7 +1,7 @@
 /*
  * NVIDIA Media controller graph management
  *
- * Copyright (c) 2015-2020, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2015-2021, NVIDIA CORPORATION.  All rights reserved.
  *
  * Author: Bryan Wu <pengw@nvidia.com>
  *
@@ -19,8 +19,12 @@
 #include <linux/regulator/consumer.h>
 #include <linux/reset.h>
 #include <linux/slab.h>
+#include <linux/version.h>
+#if KERNEL_VERSION(4, 15, 0) > LINUX_VERSION_CODE
 #include <soc/tegra/chip-id.h>
-#include <linux/tegra_pm_domains.h>
+#else
+#include <soc/tegra/fuse.h>
+#endif
 
 #include <media/media-device.h>
 #include <media/v4l2-async.h>
@@ -381,7 +385,11 @@ static int tegra_vi_graph_notify_complete(struct v4l2_async_notifier *notifier)
 		return ret;
 	}
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
 	ret = video_register_device(chan->video, VFL_TYPE_GRABBER, -1);
+#else
+	ret = video_register_device(chan->video, VFL_TYPE_VIDEO, -1);
+#endif
 	if (ret < 0) {
 		dev_err(chan->vi->dev, "failed to register %s\n",
 			chan->video->name);
@@ -633,7 +641,13 @@ static int tegra_vi_graph_parse_one(struct tegra_channel *chan,
 		entity->node = remote;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
 		entity->asd.match_type = V4L2_ASYNC_MATCH_FWNODE;
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
 		entity->asd.match.fwnode.fwnode = of_fwnode_handle(remote);
+#else
+		entity->asd.match.fwnode = of_fwnode_handle(remote);
+#endif
+
 #else
 		entity->asd.match_type = V4L2_ASYNC_MATCH_OF;
 		entity->asd.match.of.node = remote;
@@ -721,13 +735,23 @@ register_fail:
 int tegra_vi_graph_init(struct tegra_mc_vi *vi)
 {
 	struct tegra_vi_graph_entity *entity;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
 	struct v4l2_async_subdev **subdevs = NULL;
+#endif
 	unsigned int num_subdevs = 0;
 	int ret = 0, i;
 	struct device_node *ep = NULL;
 	struct device_node *next;
 	struct device_node *remote = NULL;
 	struct tegra_channel *chan;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
+	static const struct v4l2_async_notifier_operations vi_chan_notify_ops = {
+		.bound = tegra_vi_graph_notify_bound,
+		.complete = tegra_vi_graph_notify_complete,
+		.unbind = tegra_vi_graph_notify_unbind,
+	};
+#endif
+
 
 	/*
 	 * Walk the links to parse the full graph. Each struct tegra_channel
@@ -789,13 +813,20 @@ int tegra_vi_graph_init(struct tegra_mc_vi *vi)
 		entity->node = remote;
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
 		entity->asd.match_type = V4L2_ASYNC_MATCH_FWNODE;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
 		entity->asd.match.fwnode.fwnode = of_fwnode_handle(remote);
+#else
+		entity->asd.match.fwnode = of_fwnode_handle(remote);
+#endif
 #else
 		entity->asd.match_type = V4L2_ASYNC_MATCH_OF;
 		entity->asd.match.of.node = remote;
 #endif
 		list_add_tail(&entity->list, &chan->entities);
 		chan->num_subdevs++;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
+		chan->notifier.ops = chan->notifier.ops ? chan->notifier.ops : &vi_chan_notify_ops;
+#endif
 
 		/* Parse and add entities on this enpoint/channel */
 		ret = tegra_vi_graph_parse_one(chan, entity->node);
@@ -810,14 +841,18 @@ int tegra_vi_graph_init(struct tegra_mc_vi *vi)
 		}
 
 		num_subdevs = chan->num_subdevs;
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
 		subdevs = devm_kzalloc(vi->dev, sizeof(*subdevs) * num_subdevs,
 			       GFP_KERNEL);
 		if (subdevs == NULL) {
 			ret = -ENOMEM;
 			goto done;
 		}
+#endif
 
 		i = 0;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
 		list_for_each_entry(entity, &chan->entities, list)
 			subdevs[i++] = &entity->asd;
 
@@ -826,6 +861,12 @@ int tegra_vi_graph_init(struct tegra_mc_vi *vi)
 		chan->notifier.bound = tegra_vi_graph_notify_bound;
 		chan->notifier.unbind = tegra_vi_graph_notify_unbind;
 		chan->notifier.complete = tegra_vi_graph_notify_complete;
+#else
+		v4l2_async_notifier_init(&chan->notifier);
+		list_for_each_entry(entity, &chan->entities, list)
+			v4l2_async_notifier_add_subdev(&chan->notifier, &entity->asd);
+#endif
+
 		chan->link_status = 0;
 		chan->subdevs_bound = 0;
 

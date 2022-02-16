@@ -516,7 +516,7 @@ static int tegra_ahci_umh(unsigned long long block, char *block_dev)
 
 	snprintf(buf1, sizeof(buf1), "%llu", block);
 	snprintf(buf2, sizeof(buf2), "%s", block_dev);
-	argv[TEGRA_BADBLK_COMMAND] = "/system/bin/badblk.sh";
+	argv[TEGRA_BADBLK_COMMAND] = "/vendor/bin/badblk.sh";
 	argv[TEGRA_BADBLK_COMMAND_PARAM1] = buf1;
 	argv[TEGRA_BADBLK_COMMAND_PARAM2] = buf2;
 	argv[TEGRA_BADBLK_MAX_ARGUMENTS] = NULL;

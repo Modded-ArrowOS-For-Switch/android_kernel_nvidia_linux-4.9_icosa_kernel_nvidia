@@ -5,7 +5,7 @@
  * Copyright (C) 2011 Texas Instruments, Inc.
  * Copyright (C) 2011 Google, Inc.
  *
- * Copyright (C) 2014-2020, NVIDIA Corporation. All rights reserved.
+ * Copyright (C) 2014-2021, NVIDIA Corporation. All rights reserved.
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -22,12 +22,19 @@
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/io.h>
+#include <linux/iommu.h>
 #include <linux/delay.h>
 #include <linux/dma-buf.h>
+#include <linux/dma-iommu.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
 #include <linux/tegra_nvadsp.h>
+#include <linux/version.h>
+#if KERNEL_VERSION(4, 15, 0) > LINUX_VERSION_CODE
 #include <soc/tegra/chip-id.h>
+#else
+#include <soc/tegra/fuse.h>
+#endif
 #include <linux/elf.h>
 #include <linux/device.h>
 #include <linux/clk.h>
@@ -39,11 +46,8 @@
 #include <linux/tegra-firmwares.h>
 #include <linux/reset.h>
 #include <linux/poll.h>
-#include <linux/version.h>
 
-#include <asm/uaccess.h>
-
-#include <soc/tegra/chip-id.h>
+#include <linux/uaccess.h>
 
 #include "ape_actmon.h"
 #include "os.h"
@@ -87,7 +91,7 @@
 #define DISABLE_MBOX2_FULL_INT	0x0
 #define ENABLE_MBOX2_FULL_INT	0xFFFFFFFF
 
-#define LOGGER_TIMEOUT		20 /* in ms */
+#define LOGGER_TIMEOUT		1 /* in ms */
 #define ADSP_WFI_TIMEOUT	800 /* in ms */
 #define LOGGER_COMPLETE_TIMEOUT	500 /* in ms */
 
@@ -167,13 +171,11 @@ static int adsp_logger_open(struct inode *inode, struct file *file)
 	mutex_unlock(&priv.os_run_lock);
 
 	/*
-	 * checks if os_opened decrements to zero and if returns true. If true
-	 * then there has been no open.
-	*/
-	if (!atomic_dec_and_test(&logger->is_opened)) {
-		atomic_inc(&logger->is_opened);
+	 * checks if is_opened is 0, if yes, set 1 and proceed,
+	 * else return -EBUSY
+	 */
+	if (atomic_cmpxchg(&logger->is_opened, 0, 1))
 		goto err_ret;
-	}
 
 	/* loop till writer is initilized with SOH */
 	for (i = 0; i < SEARCH_SOH_RETRY; i++) {
@@ -202,8 +204,8 @@ static int adsp_logger_open(struct inode *inode, struct file *file)
 	file->private_data = logger;
 	return 0;
 err:
-	/* reset to 1 so as to mention the node is free */
-	atomic_set(&logger->is_opened, 1);
+	/* reset to 0 so as to mention the node is free */
+	atomic_set(&logger->is_opened, 0);
 err_ret:
 	return ret;
 }
@@ -216,13 +218,16 @@ static int adsp_logger_flush(struct file *file, fl_owner_t id)
 
 	dev_dbg(dev, "%s\n", __func__);
 
-	/* reset to 1 so as to mention the node is free */
-	atomic_set(&logger->is_opened, 1);
+	/* reset to 0 so as to mention the node is free */
+	atomic_set(&logger->is_opened, 0);
 	return 0;
 }
 
 static int adsp_logger_release(struct inode *inode, struct file *file)
 {
+	struct nvadsp_debug_log *logger = inode->i_private;
+
+	atomic_set(&logger->is_opened, 0);
 	return 0;
 }
 
@@ -234,7 +239,6 @@ static ssize_t adsp_logger_read(struct file *file, char __user *buf,
 	ssize_t ret_num_char = 1;
 	char last_char;
 
-loop:
 	last_char = logger->debug_ram_rdr[logger->ram_iter];
 
 	if ((last_char != EOT) && (last_char != 0)) {
@@ -270,7 +274,13 @@ loop:
 		goto exit;
 	}
 
-	goto loop;
+	last_char = BELL;
+	if (copy_to_user(buf, &last_char, 1)) {
+		dev_err(dev, "%s failed in copying bell character\n", __func__);
+		ret_num_char = -EFAULT;
+		goto exit;
+	}
+	ret_num_char = 1;
 exit:
 	return ret_num_char;
 }
@@ -294,7 +304,7 @@ static int adsp_create_debug_logger(struct dentry *adsp_debugfs_root)
 		goto err_out;
 	}
 
-	atomic_set(&logger->is_opened, 1);
+	atomic_set(&logger->is_opened, 0);
 	init_waitqueue_head(&logger->wait_queue);
 	init_completion(&logger->complete);
 	if (!debugfs_create_file("adsp_logger", S_IRUGO,
@@ -605,6 +615,94 @@ static int nvadsp_os_elf_load(const struct firmware *fw)
 	return ret;
 }
 
+/**
+ * Allocate a dma buffer and map it to a specified iova
+ * Return valid cpu virtual address on success or NULL on failure
+ */
+static void *nvadsp_dma_alloc_and_map_at(struct platform_device *pdev,
+					 size_t size, dma_addr_t iova,
+					 gfp_t flags)
+{
+	struct iommu_domain *domain = iommu_get_domain_for_dev(&pdev->dev);
+	unsigned long align_mask = ~0UL << fls_long(size - 1);
+	unsigned long shift = __ffs(domain->pgsize_bitmap);
+	unsigned long pg_size = 1UL << shift;
+	unsigned long mp_size = pg_size;
+	struct device *dev = &pdev->dev;
+	dma_addr_t aligned_iova = iova & align_mask;
+	dma_addr_t end = iova + size;
+	dma_addr_t tmp_iova, offset;
+	phys_addr_t pa, pa_new;
+	void *cpu_va;
+	int ret;
+
+	/*
+	 * Reserve iova range using aligned size: adsp memory might not start
+	 * from an aligned address by power of 2, while iommu_dma_alloc_iova()
+	 * would shift the allocation off the target iova so as to align start
+	 * address by power of 2. To prevent this shifting, use aligned size.
+	 * It might allocate an excessive iova region but it would be handled
+	 * by IOMMU core during iommu_dma_free_iova().
+	 */
+	tmp_iova = iommu_dma_alloc_iova(dev, end - aligned_iova, end - pg_size);
+	if (tmp_iova != aligned_iova) {
+		dev_err(dev, "failed to reserve iova range [%llx, %llx]\n",
+			aligned_iova, end);
+		return NULL;
+	}
+
+	dev_dbg(dev, "Reserved iova region [%llx, %llx]\n", aligned_iova, end);
+
+	/* Allocate a memory first and get a tmp_iova */
+	cpu_va = dma_alloc_coherent(dev, size, &tmp_iova, flags);
+	if (!cpu_va)
+		goto fail_dma_alloc;
+
+	/* Use tmp_iova to remap non-contiguous pages to the desired iova */
+	for (offset = 0; offset < size; offset += mp_size) {
+		dma_addr_t cur_iova = tmp_iova + offset;
+
+		mp_size = pg_size;
+		pa = iommu_iova_to_phys(domain, cur_iova);
+		/* Checking if next physical addresses are contiguous */
+		for ( ; offset + mp_size < size; mp_size += pg_size) {
+			pa_new = iommu_iova_to_phys(domain, cur_iova + mp_size);
+			if (pa + mp_size != pa_new)
+				break;
+		}
+
+		/* Remap the contiguous physical addresses together */
+		ret = iommu_map(domain, iova + offset, pa, mp_size,
+				IOMMU_READ | IOMMU_WRITE);
+		if (ret) {
+			dev_err(dev, "failed to map pa %llx va %llx size %lx\n",
+				pa, iova + offset, mp_size);
+			goto fail_map;
+		}
+
+		/* Verify if the new iova is correctly mapped */
+		if (pa != iommu_iova_to_phys(domain, iova + offset)) {
+			dev_err(dev, "mismatched pa 0x%llx <-> 0x%llx\n",
+				pa, iommu_iova_to_phys(domain, iova + offset));
+			goto fail_map;
+		}
+	}
+
+	/* Unmap and free the tmp_iova since target iova is linked */
+	iommu_unmap(domain, tmp_iova, size);
+	iommu_dma_free_iova(dev, tmp_iova, size);
+
+	return cpu_va;
+
+fail_map:
+	iommu_unmap(domain, iova, offset);
+	dma_free_coherent(dev, size, cpu_va, tmp_iova);
+fail_dma_alloc:
+	iommu_dma_free_iova(dev, end - aligned_iova, end - pg_size);
+
+	return NULL;
+}
+
 static int allocate_memory_for_adsp_os(void)
 {
 	struct platform_device *pdev = priv.pdev;
@@ -621,14 +719,14 @@ static int allocate_memory_for_adsp_os(void)
 	addr = priv.adsp_os_addr;
 	size = priv.adsp_os_size;
 #if defined(CONFIG_TEGRA_NVADSP_ON_SMMU)
-	dram_va = dma_alloc_at_coherent(dev, size, &addr, GFP_KERNEL);
+	dram_va = nvadsp_dma_alloc_and_map_at(pdev, size, addr, GFP_KERNEL);
 	if (!dram_va) {
 		dev_err(dev, "unable to allocate SMMU pages\n");
 		ret = -ENOMEM;
 		goto end;
 	}
 #else
-	dram_va = ioremap_nocache(addr, size);
+	dram_va = ioremap(addr, size);
 	if (!dram_va) {
 		dev_err(dev, "remap failed for addr 0x%llx\n", addr);
 		ret = -ENOMEM;
@@ -645,7 +743,7 @@ static void deallocate_memory_for_adsp_os(struct device *dev)
 #if defined(CONFIG_TEGRA_NVADSP_ON_SMMU)
 	void *va = nvadsp_da_to_va_mappings(priv.adsp_os_addr,
 			priv.adsp_os_size);
-	dma_free_coherent(dev, priv.adsp_os_addr, va, priv.adsp_os_size);
+	dma_free_coherent(dev, priv.adsp_os_size, va, priv.adsp_os_addr);
 #endif
 }
 
@@ -656,7 +754,7 @@ static void nvadsp_set_shared_mem(struct platform_device *pdev,
 	struct nvadsp_drv_data *drv_data = platform_get_drvdata(pdev);
 	struct device *dev = &pdev->dev;
 	struct nvadsp_os_args *os_args;
-	enum tegra_chipid chip_id;
+	u8 chip_id;
 
 	shared_mem->os_args.dynamic_app_support = dynamic_app_support;
 	/* set logger strcuture with required properties */
@@ -665,8 +763,11 @@ static void nvadsp_set_shared_mem(struct platform_device *pdev,
 	priv.logger.dev = dev;
 	priv.adsp_os_fw_loaded = true;
 
-	chip_id = tegra_get_chipid();
+	chip_id = tegra_get_chip_id();
 	os_args = &shared_mem->os_args;
+	/* Chip id info is communicated twice to ADSP
+	 * TODO::clean up the redundant comm.
+	 */
 	os_args->chip_id = chip_id;
 
 	drv_data->shared_adsp_os_data = shared_mem;
@@ -680,12 +781,22 @@ static int __nvadsp_os_secload(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	void *dram_va;
 
-	dram_va = dma_alloc_at_coherent(dev, size, &addr, GFP_KERNEL);
-	if (!dram_va) {
-		dev_err(dev, "unable to allocate shared region\n");
-		return -ENOMEM;
+	if (drv_data->chip_data->adsp_shared_mem_hwmbox != 0) {
+		dram_va = nvadsp_alloc_coherent(size, &addr, GFP_KERNEL);
+		if (dram_va == NULL) {
+			dev_err(dev, "unable to allocate shared region\n");
+			return -ENOMEM;
+		}
+	} else {
+		dram_va = nvadsp_dma_alloc_and_map_at(pdev, size, addr,
+								GFP_KERNEL);
+		if (dram_va == NULL) {
+			dev_err(dev, "unable to allocate shared region\n");
+			return -ENOMEM;
+		}
 	}
 
+	drv_data->shared_adsp_os_data_iova = addr;
 	nvadsp_set_shared_mem(pdev, dram_va, 0);
 
 	return 0;
@@ -754,8 +865,7 @@ int nvadsp_os_load(void)
 
 	if (!priv.pdev) {
 		pr_err("ADSP Driver is not initialized\n");
-		ret = -EINVAL;
-		goto end;
+		return -EINVAL;
 	}
 
 	mutex_lock(&priv.fw_load_lock);
@@ -829,10 +939,7 @@ static int nvadsp_set_ape_emc_freq(struct nvadsp_drv_data *drv_data)
 	if (!ape_emc_freq)
 		return 0;
 
-	ret = tegra_bwmgr_set_emc(drv_data->bwmgr, ape_emc_freq * 1000,
-				  TEGRA_BWMGR_SET_EMC_FLOOR);
-	if (ret)
-		dev_err(dev, "failed to set emc freq rate:%d\n", ret);
+	ret = nvadsp_set_bw(drv_data, ape_emc_freq);
 	dev_dbg(dev, "ape.emc freq %luKHz\n",
 		tegra_bwmgr_get_emc_rate() / 1000);
 
@@ -1306,7 +1413,7 @@ static void get_adsp_state(void)
 	drv_data = platform_get_drvdata(priv.pdev);
 	dev = &priv.pdev->dev;
 
-	if (drv_data->chip_data->adsp_state_hwmbox == -1) {
+	if (drv_data->chip_data->adsp_state_hwmbox == 0) {
 		dev_info(dev, "%s: No state hwmbox available\n", __func__);
 		return;
 	}
@@ -1578,6 +1685,8 @@ int nvadsp_os_start(void)
 	struct nvadsp_drv_data *drv_data;
 	struct device *dev;
 	int ret = 0;
+	static int cold_start = 1;
+	u8 chip_id;
 
 	if (!priv.pdev) {
 		pr_err("ADSP Driver is not initialized\n");
@@ -1608,6 +1717,32 @@ int nvadsp_os_start(void)
 	ret = setup_interrupts(&priv);
 	if (ret < 0)
 		goto unlock;
+
+	if (cold_start && drv_data->chip_data->adsp_shared_mem_hwmbox != 0) {
+		hwmbox_writel((uint32_t)drv_data->shared_adsp_os_data_iova,
+				drv_data->chip_data->adsp_shared_mem_hwmbox);
+		/* Write ACSR base address only once */
+		cold_start = 0;
+	}
+
+	if (drv_data->chip_data->hwmb.hwmbox1_reg != 0) {
+		chip_id = tegra_get_chip_id();
+		/* Write chip id info to HWMBOX1 to enable ast config
+		 * later for t186/t196
+		 */
+		if (chip_id != 0) {
+			hwmbox_writel((uint32_t)chip_id,
+				drv_data->chip_data->hwmb.hwmbox1_reg);
+		} else {
+			dev_err(dev, "chip id is NULL\n");
+			ret = -EINVAL;
+			free_interrupts(&priv);
+#ifdef CONFIG_PM
+			pm_runtime_put_sync(&priv.pdev->dev);
+#endif
+			goto unlock;
+		}
+	}
 
 	ret = __nvadsp_os_start();
 	if (ret) {
@@ -2028,11 +2163,8 @@ static ssize_t tegrafw_read_adsp(struct device *dev,
 int __init nvadsp_os_probe(struct platform_device *pdev)
 {
 	struct nvadsp_drv_data *drv_data = platform_get_drvdata(pdev);
-	struct device *dev = &pdev->dev;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
-	uint64_t dma_mask;
-#endif
 	uint16_t com_mid = ADSP_COM_MBOX_ID;
+	struct device *dev = &pdev->dev;
 	int ret = 0;
 
 	priv.unit_fpga_reset_reg = drv_data->base_regs[UNIT_FPGA_RST];
@@ -2049,15 +2181,6 @@ int __init nvadsp_os_probe(struct platform_device *pdev)
 		drv_data->deassert_adsp = __deassert_adsp;
 	}
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
-	ret = of_property_read_u64(dev->of_node, "dma-mask", &dma_mask);
-	if (ret) {
-		dev_err(&pdev->dev, "Missing property dma-mask\n");
-		goto end;
-	} else {
-		dma_set_mask_and_coherent(&pdev->dev, dma_mask);
-	}
-#endif
 	ret = nvadsp_os_init(pdev);
 	if (ret) {
 		dev_err(dev, "failed to init os\n");

@@ -47,20 +47,24 @@ static int t186_syncpt_mark_unused(struct nvhost_syncpt *sp, u32 id)
 {
 	struct nvhost_master *dev = syncpt_to_dev(sp);
 
-	/* move syncpoint to VM */
-	host1x_hypervisor_writel(dev->dev,
-			(host1x_sync_syncpt_vm_0_r() + id * 4),
-			nvhost_host1x_get_vmid(dev->dev));
+	if (nvhost_dev_is_virtual(dev->dev) == false) {
+		/* move syncpoint to VM */
+		host1x_hypervisor_writel(dev->dev,
+				(host1x_sync_syncpt_vm_0_r() + id * 4),
+				nvhost_host1x_get_vmid(dev->dev));
+	}
 
 	/* reserve it for channel 0xff */
 	host1x_writel(dev->dev,
 		(host1x_sync_syncpt_ch_app_0_r() + id * 4),
 		host1x_sync_syncpt_ch_app_0_syncpt_ch_f(0xff));
 
-	/* enable protection */
-	host1x_hypervisor_writel(dev->dev,
-		host1x_sync_syncpt_prot_en_0_r(),
-		host1x_sync_syncpt_prot_en_0_ch_en_f(1));
+	if (nvhost_dev_is_virtual(dev->dev) == false) {
+		/* enable protection */
+		host1x_hypervisor_writel(dev->dev,
+			host1x_sync_syncpt_prot_en_0_r(),
+			host1x_sync_syncpt_prot_en_0_ch_en_f(1));
+	}
 
 	return 0;
 }
@@ -72,7 +76,7 @@ static void t186_syncpt_mutex_owner(struct nvhost_syncpt *sp,
 				unsigned int *chid)
 {
 	struct nvhost_master *dev = syncpt_to_dev(sp);
-	u32 owner = host1x_hypervisor_readl(dev->dev,
+	u32 owner = host1x_common_readl(dev->dev,
 		host1x_sync_common_mlock_r() + idx * 4);
 
 	*chid = host1x_sync_common_mlock_ch_v(owner);

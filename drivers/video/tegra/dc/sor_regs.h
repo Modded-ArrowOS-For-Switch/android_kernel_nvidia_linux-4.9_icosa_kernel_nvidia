@@ -1,7 +1,7 @@
 /*
 * sor_regs.h: sor register definitions.
 *
-* Copyright (c) 2011-2018, NVIDIA CORPORATION, All rights reserved.
+* Copyright (c) 2011-2019, NVIDIA CORPORATION, All rights reserved.
 *
 * This software is licensed under the terms of the GNU General Public
 * License version 2, as published by the Free Software Foundation, and
@@ -1052,6 +1052,9 @@
 #define NV_SOR_HDMI_GCP_STATUS_ACTIVE_END_PP_SHIFT	(8)
 #define NV_SOR_HDMI_GCP_STATUS_ACTIVE_END_PP_MASK	(0x7)
 #define NV_SOR_HDMI_GCP_SUBPACK(i)			(0xc5 + i)
+#define NV_SOR_HDMI_GCP_SUBPACK_SB0_SET_AVMUTE	(1 << 0)
+#define NV_SOR_HDMI_GCP_SUBPACK_SB0_CLR_AVMUTE	(1 << 4)
+#define NV_SOR_HDMI_GCP_SUBPACK_SB0_SHIFT		(0)
 #define NV_SOR_HDMI_GCP_SUBPACK_SB1_SHIFT		(8)
 #define NV_SOR_HDMI_GCP_SUBPACK_SB2_SHIFT		(16)
 #define NV_SOR_INPUT_CONTROL				0xe8
@@ -1113,7 +1116,9 @@
 #define NV_SOR_HDMI_GENERIC_SUBPACK3_LOW		0xaf
 #define NV_SOR_HDMI_GENERIC_SUBPACK3_HIGH		0xb0
 #define NV_SOR_AUDIO_CTRL_AFIFO_FLUSH		(1 << 12)
+#define NV_SOR_AUDIO_CTRL_SOURCE_SELECT(x)	(((x) & 0x3) << 20)
 #define NV_SOR_AUDIO_CTRL_SRC_HDA		(0x2 << 20)
+#define NV_SOURCE_SELECT_MASK			0x3
 #define NV_SOR_AUDIO_CTRL_NULL_SAMPLE_EN	(1 << 29)
 #define NV_SOR_AUDIO_CTRL_NULL_SAMPLE_DIS	(0 << 29)
 #define NV_SOR_AUDIO_DEBUG			0xfd
@@ -1124,6 +1129,7 @@
 #define NV_SOR_AUDIO_NVAL_0480			0x103
 #define NV_SOR_AUDIO_NVAL_0960			0x104
 #define NV_SOR_AUDIO_NVAL_1920			0x105
+#define NV_SOR_AUDIO_HDA_CODEC_SCRATCH0		0x10a
 #define NV_SOR_SEQ_INST0			0x22
 #define NV_SOR_SEQ_INST8			0x2a
 #define NV_SOR_HDMI_CTRL			0xc0
@@ -1149,6 +1155,10 @@
 #define NV_SOR_AUDIO_GEN_CTRL			0x117
 #define NV_SOR_AUDIO_GEN_CTRL_DEV_ID_SHIFT	(16)
 #define NV_SOR_AUDIO_GEN_CTRL_DEV_ID_MASK	(0xffff)
+#define NV_SOR_INT_STATUS			0x11c
+#define NV_SOR_INT_CODEC_SCRATCH0		(1 << 0)
+#define NV_SOR_INT_MASK				0x11d
+#define NV_SOR_INT_ENABLE			0x11e
 
 #define NV_SOR_HDMI_VSI_INFOFRAME_CTRL		0x123
 #define NV_SOR_HDMI_VSI_INFOFRAME_CTRL_CHECKSUM_ENABLE		(1 << 9)

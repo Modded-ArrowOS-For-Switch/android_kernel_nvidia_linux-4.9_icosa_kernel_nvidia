@@ -3,7 +3,7 @@
  *
  * Tegra NvDLA Driver
  *
- * Copyright (c) 2016-2020, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2016-2021, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -127,11 +127,18 @@ struct nvdla_get_q_status_args {
  *
  * @handle		handle to buffer allocated in userspace
  * @offset		offset in buffer
+ * @type		buffer heap type
+ * @reserved		reserved for future use
  *
  */
 struct nvdla_mem_handle {
 	__u32 handle;
 	__u32 offset;
+#define NVDLA_BUFFER_TYPE_MC		0U
+#define NVDLA_BUFFER_TYPE_CV		1U
+#define NVDLA_BUFFER_TYPE_INTERNAL	2U
+	__u8 type;
+	__u8 reserved[3];
 };
 
 /**
@@ -167,7 +174,7 @@ struct nvdla_ioctl_submit_task {
 	__u8 num_sof_timestamps;
 	__u8 num_eof_timestamps;
 	__u8 reserved0[1];
-#define NVDLA_MAX_BUFFERS_PER_TASK (6144)
+#define MAX_NVDLA_BUFFERS_PER_TASK (384U)
 	__u32 num_addresses;
 	__u16 flags;
 	__u16 reserved1;

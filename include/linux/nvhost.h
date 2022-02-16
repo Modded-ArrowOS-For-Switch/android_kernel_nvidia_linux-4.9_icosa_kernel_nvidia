@@ -3,7 +3,7 @@
  *
  * Tegra graphics host driver
  *
- * Copyright (c) 2009-2020, NVIDIA Corporation. All rights reserved.
+ * Copyright (c) 2009-2022, NVIDIA Corporation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -31,6 +31,7 @@
 #include <linux/pm_domain.h>
 #include <linux/pm_qos.h>
 #include <linux/time.h>
+#include <linux/version.h>
 
 #ifdef CONFIG_TEGRA_HOST1X
 #include <linux/host1x.h>
@@ -52,12 +53,13 @@ struct nvhost_sync_pt;
 enum nvdev_fence_kind;
 struct nvdev_fence;
 struct sync_pt;
+struct dma_fence;
 
 #define NVHOST_MODULE_MAX_CLOCKS		8
 #define NVHOST_MODULE_MAX_SYNCPTS		16
 #define NVHOST_MODULE_MAX_WAITBASES		3
 #define NVHOST_MODULE_MAX_MODMUTEXES		5
-#define NVHOST_MODULE_MAX_IORESOURCE_MEM	4
+#define NVHOST_MODULE_MAX_IORESOURCE_MEM	5
 #define NVHOST_NAME_SIZE			24
 #define NVSYNCPT_INVALID			(-1)
 #define NVHOST_MODULE_MAX_FREQS			8
@@ -113,12 +115,20 @@ struct nvhost_actmon_register {
 	u32 val;
 };
 
+enum tegra_emc_request_type {
+	TEGRA_SET_EMC_FLOOR,		/* lower bound */
+	TEGRA_SET_EMC_CAP,		/* upper bound */
+	TEGRA_SET_EMC_ISO_CAP,		/* upper bound that affects ISO Bw */
+	TEGRA_SET_EMC_SHARED_BW,	/* shared bw request */
+	TEGRA_SET_EMC_SHARED_BW_ISO,	/* for use by ISO Mgr only */
+	TEGRA_SET_EMC_REQ_COUNT		/* Should always be last */
+};
+
 struct nvhost_clock {
 	char *name;
 	unsigned long default_rate;
 	u32 moduleid;
-	int reset;
-	int bwmgr_request_type;
+	enum tegra_emc_request_type request_type;
 	bool disable_scaling;
 	unsigned long devfreq_rate;
 };
@@ -198,6 +208,8 @@ struct nvhost_device_data {
 	bool		support_abort_on_close;
 
 	char		*firmware_name;	/* Name of firmware */
+	bool		firmware_not_in_subdir; /* Firmware is not located in
+                                                   chip subdirectory */
 
 	bool		engine_can_cg;	/* True if CG is enabled */
 	bool		can_powergate;	/* True if module can be power gated */
@@ -326,9 +338,6 @@ struct nvhost_device_data {
 	/* Used to add platform specific masks on reloc address */
 	dma_addr_t (*get_reloc_phys_addr)(dma_addr_t phys_addr, u32 reloc_type);
 
-	/* Used to get platform specific dma direction flags based on relocs */
-	enum dma_data_direction (*get_dma_direction)(u32 reloc_type);
-
 	/* Allocates a context handler for the device */
 	struct nvhost_hwctx_handler *(*alloc_hwctx_handler)(u32 syncpt,
 			struct nvhost_channel *ch);
@@ -337,8 +346,8 @@ struct nvhost_device_data {
 	int (*pre_virt_init)(struct platform_device *pdev);
 	int (*post_virt_init)(struct platform_device *pdev);
 
-	/* bond out device id */
-	unsigned int bond_out_id;
+	/* engine specific functions */
+	int (*memory_init)(struct platform_device *pdev);
 
 	phys_addr_t carveout_addr;
 	phys_addr_t carveout_size;
@@ -378,6 +387,12 @@ struct nvhost_device_data {
 	void *debug_dump_data;
 	void (*debug_dump_device)(void *dev);
 
+	/* icc client id for emc requests */
+	int icc_id;
+
+	/* icc_path handle handle */
+	struct icc_path *icc_path_handle;
+
 	/* bandwidth manager client id for emc requests */
 	int bwmgr_client_id;
 
@@ -393,9 +408,6 @@ struct nvhost_device_data {
 	/* deliver task timestamps for falcon */
 	void (*enable_timestamps)(struct platform_device *pdev,
 			struct nvhost_cdma *cdma, dma_addr_t timestamp_addr);
-
-	/* don't apply platform dma mask */
-	bool no_platform_dma_mask;
 };
 
 
@@ -461,7 +473,7 @@ static inline void nvhost_syncpt_cpu_incr_ext(struct platform_device *dev,
 
 static inline int nvhost_syncpt_wait_timeout_ext(
 			struct platform_device *dev, u32 id, u32 thresh,
-			u32 timeout, u32 *value, struct timespec *ts)
+			u32 timeout, u32 *value, struct timespec64 *ts)
 {
 	struct host1x *host = nvhost_get_host1x(dev);
 	struct host1x_syncpt *syncpt = host1x_syncpt_get(host, id);
@@ -551,7 +563,7 @@ static inline void nvhost_syncpt_set_min_eq_max_ext(
 
 static inline const struct firmware *
 nvhost_client_request_firmware(struct platform_device *dev,
-	const char *fw_name)
+	const char *fw_name, bool warn)
 {
 	return NULL;
 }
@@ -716,6 +728,9 @@ int nvhost_module_busy_ext(struct platform_device *dev);
 /* This power OFF only host1x and doesn't power OFF module */
 void nvhost_module_idle_ext(struct platform_device *dev);
 
+/* public api to return platform_device ptr to the default host1x instance */
+struct platform_device *nvhost_get_default_device(void);
+
  /* Public PM nvhost APIs. */
 /* This power ON both host1x and module */
 int nvhost_module_busy(struct platform_device *dev);
@@ -731,9 +746,6 @@ int nvhost_channel_map(struct nvhost_device_data *pdata,
 			struct nvhost_channel **ch,
 			void *identifier);
 void nvhost_putchannel(struct nvhost_channel *ch, int cnt);
-void nvhost_getchannel(struct nvhost_channel *ch);
-bool nvhost_channel_is_resource_policy_per_device(
-			struct nvhost_device_data *pdata);
 /* Allocate memory for a job. Just enough memory will be allocated to
  * accomodate the submit announced in submit header.
  */
@@ -770,7 +782,7 @@ u32 nvhost_syncpt_incr_max_ext(struct platform_device *dev, u32 id, u32 incrs);
 void nvhost_syncpt_cpu_incr_ext(struct platform_device *dev, u32 id);
 int nvhost_syncpt_read_ext_check(struct platform_device *dev, u32 id, u32 *val);
 int nvhost_syncpt_wait_timeout_ext(struct platform_device *dev, u32 id, u32 thresh,
-	u32 timeout, u32 *value, struct timespec *ts);
+	u32 timeout, u32 *value, struct timespec64 *ts);
 int nvhost_syncpt_create_fence_single_ext(struct platform_device *dev,
 	u32 id, u32 thresh, const char *name, int *fence_fd);
 int nvhost_syncpt_is_expired_ext(struct platform_device *dev,
@@ -813,7 +825,7 @@ int nvhost_intr_register_fast_notifier(struct platform_device *pdev,
 				  void (*callback)(void *, int),
 				  void *private_data);
 
-#if defined(CONFIG_TEGRA_GRHOST) && defined(CONFIG_DEBUG_FS)
+#if IS_ENABLED(CONFIG_TEGRA_GRHOST) && defined(CONFIG_DEBUG_FS)
 void nvhost_debug_dump_device(struct platform_device *pdev);
 #else
 static inline void nvhost_debug_dump_device(struct platform_device *pdev)
@@ -821,43 +833,146 @@ static inline void nvhost_debug_dump_device(struct platform_device *pdev)
 }
 #endif
 
-#ifdef CONFIG_TEGRA_GRHOST
+#if IS_ENABLED(CONFIG_TEGRA_GRHOST)
 const struct firmware *
 nvhost_client_request_firmware(struct platform_device *dev,
-	const char *fw_name);
+	const char *fw_name, bool warn);
 #else
 static inline const struct firmware *
 nvhost_client_request_firmware(struct platform_device *dev,
-	const char *fw_name)
+	const char *fw_name, bool warn)
 {
 	return NULL;
 }
 #endif
 
-#ifdef CONFIG_TEGRA_GRHOST_SYNC
-struct sync_fence *nvhost_sync_create_fence(
+struct nvhost_fence;
+
+#if IS_ENABLED(CONFIG_TEGRA_GRHOST_SYNC)
+
+int nvhost_fence_foreach_pt(
+	struct nvhost_fence *fence,
+	int (*iter)(struct nvhost_ctrl_sync_fence_info, void *),
+	void *data);
+
+int nvhost_fence_get_pt(
+	struct nvhost_fence *fence, size_t i,
+	u32 *id, u32 *threshold);
+
+struct nvhost_fence *nvhost_fence_create(
 		struct platform_device *pdev,
 		struct nvhost_ctrl_sync_fence_info *pts,
 		u32 num_pts,
 		const char *name);
+int nvhost_fence_create_fd(
+		struct platform_device *pdev,
+		struct nvhost_ctrl_sync_fence_info *pts,
+		u32 num_pts,
+		const char *name,
+		s32 *fence_fd);
+
+struct nvhost_fence *nvhost_fence_get(int fd);
+struct nvhost_fence *nvhost_fence_dup(struct nvhost_fence *fence);
+int nvhost_fence_num_pts(struct nvhost_fence *fence);
+int nvhost_fence_install(struct nvhost_fence *fence, int fence_fd);
+void nvhost_fence_put(struct nvhost_fence *fence);
+void nvhost_fence_wait(struct nvhost_fence *fence, u32 timeout_in_ms);
+
+#else
+
+static inline int nvhost_fence_foreach_pt(
+	struct nvhost_fence *fence,
+	int (*iter)(struct nvhost_ctrl_sync_fence_info, void *d),
+	void *d)
+{
+	return -ENOTSUPP;
+}
+
+static inline struct nvhost_fence *nvhost_create_fence(
+		struct platform_device *pdev,
+		struct nvhost_ctrl_sync_fence_info *pts,
+		u32 num_pts,
+		const char *name)
+{
+	return ERR_PTR(-EINVAL);
+}
+
+static inline int nvhost_fence_create_fd(
+		struct platform_device *pdev,
+		struct nvhost_ctrl_sync_fence_info *pts,
+		u32 num_pts,
+		const char *name,
+		s32 *fence_fd)
+{
+	return -EINVAL;
+}
+
+static inline struct nvhost_fence *nvhost_fence_get(int fd)
+{
+	return NULL;
+}
+
+static inline int nvhost_fence_num_pts(struct nvhost_fence *fence)
+{
+	return 0;
+}
+
+static inline void nvhost_fence_put(struct nvhost_fence *fence)
+{
+}
+
+static inline void nvhost_fence_wait(struct nvhost_fence *fence, u32 timeout_in_ms)
+{
+}
+
+#endif
+
+#if IS_ENABLED(CONFIG_TEGRA_GRHOST_SYNC) && !defined(CONFIG_SYNC)
+int nvhost_dma_fence_unpack(struct dma_fence *fence, u32 *id, u32 *threshold);
+bool nvhost_dma_fence_is_waitable(struct dma_fence *fence);
+#else
+static inline int nvhost_dma_fence_unpack(struct dma_fence *fence, u32 *id,
+					  u32 *threshold)
+{
+	return -EINVAL;
+}
+static inline bool nvhost_dma_fence_is_waitable(struct dma_fence *fence)
+{
+	return false;
+}
+#endif
+
+#if IS_ENABLED(CONFIG_TEGRA_GRHOST_SYNC) && defined(CONFIG_SYNC)
+struct sync_fence *nvhost_sync_fdget(int fd);
+int nvhost_sync_num_pts(struct sync_fence *fence);
+struct sync_fence *nvhost_sync_create_fence(struct platform_device *pdev,
+		struct nvhost_ctrl_sync_fence_info *pts,
+				u32 num_pts, const char *name);
 int nvhost_sync_create_fence_fd(
 		struct platform_device *pdev,
 		struct nvhost_ctrl_sync_fence_info *pts,
 		u32 num_pts,
 		const char *name,
 		s32 *fence_fd);
-struct sync_fence *nvhost_sync_fdget(int fd);
-int nvhost_sync_num_pts(struct sync_fence *fence);
-u32 nvhost_sync_pt_id(struct sync_pt *pt);
-u32 nvhost_sync_pt_thresh(struct sync_pt *pt);
 int nvhost_sync_fence_set_name(int fence_fd, const char *name);
-
+u32 nvhost_sync_pt_id(struct sync_pt *__pt);
+u32 nvhost_sync_pt_thresh(struct sync_pt *__pt);
+struct sync_pt *nvhost_sync_pt_from_fence_index(struct sync_fence *fence,
+                u32 sync_pt_index);
 #else
-static inline struct sync_fence *nvhost_sync_create_fence(
-		struct platform_device *pdev,
+static inline struct sync_fence *nvhost_sync_fdget(int fd)
+{
+	return NULL;
+}
+
+static inline int nvhost_sync_num_pts(struct sync_fence *fence)
+{
+	return 0;
+}
+
+static inline struct sync_fence *nvhost_sync_create_fence(struct platform_device *pdev,
 		struct nvhost_ctrl_sync_fence_info *pts,
-		u32 num_pts,
-		const char *name)
+				u32 num_pts, const char *name)
 {
 	return ERR_PTR(-EINVAL);
 }
@@ -872,31 +987,26 @@ static inline int nvhost_sync_create_fence_fd(
 	return -EINVAL;
 }
 
-static inline struct sync_fence *nvhost_sync_fdget(int fd)
-{
-	return NULL;
-}
-
-static inline int nvhost_sync_num_pts(struct sync_fence *fence)
-{
-	return 0;
-}
-
-static inline u32 nvhost_sync_pt_id(struct sync_pt *pt)
-{
-	return NVSYNCPT_INVALID;
-}
-
-static inline u32 nvhost_sync_pt_thresh(struct sync_pt *pt)
-{
-	return 0;
-}
-
 static inline int nvhost_sync_fence_set_name(int fence_fd, const char *name)
 {
 	return -EINVAL;
 }
 
+static inline u32 nvhost_sync_pt_id(struct sync_pt *__pt)
+{
+	return 0;
+}
+
+static inline u32 nvhost_sync_pt_thresh(struct sync_pt *__pt)
+{
+	return 0;
+}
+
+static inline struct sync_pt *nvhost_sync_pt_from_fence_index(
+                struct sync_fence *fence, u32 sync_pt_index)
+{
+	return NULL;
+}
 #endif
 
 /* Hacky way to get access to struct nvhost_device_data for VI device. */

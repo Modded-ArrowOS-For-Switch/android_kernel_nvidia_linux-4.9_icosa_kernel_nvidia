@@ -1,5 +1,3 @@
-ifdef CONFIG_TEGRA_T19X_GRHOST
-
 GCOV_PROFILE := y
 ccflags-y += -I$(srctree.nvidia)/drivers/video/tegra/host
 ccflags-y += -I$(srctree.nvidia)/include
@@ -15,5 +13,3 @@ nvhost-nvdla-objs  = \
 		nvdla_debug.o
 
 obj-$(CONFIG_TEGRA_GRHOST_NVDLA) += nvhost-nvdla.o
-
-endif

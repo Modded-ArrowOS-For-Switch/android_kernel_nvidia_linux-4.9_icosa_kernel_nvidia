@@ -12,6 +12,7 @@
  *
  */
 
+
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/interrupt.h>
@@ -26,17 +27,21 @@
 #include <linux/of_gpio.h>
 #include <asm/arch_timer.h>
 #include <linux/platform/tegra/ptp-notifier.h>
+#include <linux/time.h>
+#include <linux/version.h>
 #include <uapi/linux/nvpps_ioctl.h>
 
 
-//#define NVPPS_MAP_EQOS_REGS
-//#define NVPPS_ARM_COUNTER_PROFILING
-//#define NVPPS_EQOS_REG_PROFILING
-
+/* the following contrl flags are for
+ * debugging pirpose only
+ */
+/* #define NVPPS_MAP_EQOS_REGS */
+/* #define NVPPS_ARM_COUNTER_PROFILING */
+/* #define NVPPS_EQOS_REG_PROFILING */
 
 
 #define MAX_NVPPS_SOURCES	1
-#define NVPPS_DEF_MODE	NVPPS_MODE_GPIO
+#define NVPPS_DEF_MODE		NVPPS_MODE_GPIO
 
 /* statics */
 static struct class	*s_nvpps_class;
@@ -55,19 +60,23 @@ struct nvpps_device_data {
 	unsigned int		gpio_pin;
 	int			irq;
 	bool			irq_registered;
+	bool			use_gpio_int_timesatmp;
 
 	bool			pps_event_id_valid;
 	unsigned int		pps_event_id;
+	u32			actual_evt_mode;
 	u64			tsc;
 	u64			phc;
 	u64			irq_latency;
 	u64			tsc_res_ns;
 	raw_spinlock_t		lock;
+	struct mutex		ts_lock;
 
 	u32			evt_mode;
 	u32			tsc_mode;
 
 	struct timer_list	timer;
+
 	volatile bool		timer_inited;
 
 	wait_queue_head_t	pps_event_queue;
@@ -75,7 +84,7 @@ struct nvpps_device_data {
 
 #ifdef NVPPS_MAP_EQOS_REGS
 	u64			eqos_base_addr;
-#endif /*NVPPS_MAP_EQOS_REGS*/
+#endif /* NVPPS_MAP_EQOS_REGS */
 };
 
 
@@ -95,22 +104,19 @@ struct nvpps_file_data {
 #define MAC_STNSR_TSSS_HPOS 30
 
 #define GET_VALUE(data, lbit, hbit) ((data >> lbit) & (~(~0<<(hbit-lbit+1))))
-#define MAC_STNSR_OFFSET ((u32 *)(BASE_ADDRESS + 0xb0c))
-#define MAC_STNSR_RD(data) \
-	do { \
-		data = ioread32((void *)MAC_STNSR_OFFSET); \
-	} while(0)
+#define MAC_STNSR_OFFSET ((volatile u32 *)(BASE_ADDRESS + 0xb0c))
+#define MAC_STNSR_RD(data) do {\
+	(data) = ioread32((void *)MAC_STNSR_OFFSET);\
+} while (0)
+#define MAC_STSR_OFFSET ((volatile u32 *)(BASE_ADDRESS + 0xb08))
+#define MAC_STSR_RD(data) do {\
+	(data) = ioread32((void *)MAC_STSR_OFFSET);\
+} while (0)
 
-#define MAC_STSR_OFFSET ((u32 *)(BASE_ADDRESS + 0xb08))
-#define MAC_STSR_RD(data) \
-	do { \
-		data = ioread32((void *)MAC_STSR_OFFSET); \
-	} while(0)
-
-#endif /*NVPPS_MAP_EQOS_REGS*/
+#endif /* NVPPS_MAP_EQOS_REGS */
 
 
-
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 2, 0)
 static inline u64 __arch_counter_get_cntvct(void)
 {
 	u64 cval;
@@ -119,6 +125,7 @@ static inline u64 __arch_counter_get_cntvct(void)
 
 	return cval;
 }
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(5, 2, 0) */
 
 
 #ifdef NVPPS_MAP_EQOS_REGS
@@ -137,10 +144,8 @@ static inline u64 get_systime(struct nvpps_device_data *pdev_data, u64 *tsc)
 	/* read the nsec part of the PHC one more time */
 	MAC_STNSR_RD(varmac_stnsr2);
 
-	ns1 = GET_VALUE(varmac_stnsr1, MAC_STNSR_TSSS_LPOS,
-			MAC_STNSR_TSSS_HPOS);
-	ns2 = GET_VALUE(varmac_stnsr2, MAC_STNSR_TSSS_LPOS,
-			MAC_STNSR_TSSS_HPOS);
+	ns1 = GET_VALUE(varmac_stnsr1, MAC_STNSR_TSSS_LPOS, MAC_STNSR_TSSS_HPOS);
+	ns2 = GET_VALUE(varmac_stnsr2, MAC_STNSR_TSSS_LPOS, MAC_STNSR_TSSS_HPOS);
 
 	/* if ns1 is greater than ns2, it means nsec counter rollover
 	 * happened. In that case read the updated sec counter again
@@ -159,7 +164,7 @@ static inline u64 get_systime(struct nvpps_device_data *pdev_data, u64 *tsc)
 
 	return ns;
 }
-#endif /*NVPPS_MAP_EQOS_REGS*/
+#endif /* NVPPS_MAP_EQOS_REGS */
 
 
 
@@ -169,16 +174,26 @@ static inline u64 get_systime(struct nvpps_device_data *pdev_data, u64 *tsc)
 static void nvpps_get_ts(struct nvpps_device_data *pdev_data, bool in_isr)
 {
 	u64		tsc;
-	u64 		irq_tsc = 0;
-	u64 		phc = 0;
+	u64		tsc1, tsc2;
+	u64		irq_tsc = 0;
+	u64		phc = 0;
 	u64		irq_latency = 0;
-	unsigned long 	flags;
+	unsigned long	flags;
 
-	/* get the gpio interrupt timestamp */
 	if (in_isr) {
+		/* initialize irq_tsc to the current TSC just in case the
+		 * gpio_timestamp_read call failed so the irq_tsc can be
+		 * closer to when the interrupt actually occured
+		 */
 		irq_tsc = __arch_counter_get_cntvct();
-	} else {
-		irq_tsc = __arch_counter_get_cntvct();//0;
+		if (pdev_data->use_gpio_int_timesatmp) {
+			int	err;
+			/* get the interrupt timestamp */
+			err = gpio_timestamp_read(pdev_data->gpio_pin, &irq_tsc);
+			if (err) {
+				dev_err(pdev_data->dev, "failed to read timestamp data err(%d)\n", err);
+			}
+		}
 	}
 
 #ifdef NVPPS_MAP_EQOS_REGS
@@ -187,18 +202,26 @@ static void nvpps_get_ts(struct nvpps_device_data *pdev_data, bool in_isr)
 		/* get both the phc and tsc */
 		phc = get_systime(pdev_data, &tsc);
 	} else {
-#endif /*NVPPS_MAP_EQOS_REGS*/
+#endif /* NVPPS_MAP_EQOS_REGS */
+		/* get the TSC time before the function call */
+		tsc1 = __arch_counter_get_cntvct();
 		/* get the phc from eqos driver */
 		get_ptp_hwtime(&phc);
-		/* get the current TSC time */
-		tsc = __arch_counter_get_cntvct();
+		/* get the TSC time after the function call */
+		tsc2 = __arch_counter_get_cntvct();
+		/* we do not know the latency of the get_ptp_hwtime() function
+		 * so we are measuring the before and after and use the two
+		 * samples average to approximate the time when the PTP clock
+		 * is sampled
+		 */
+		tsc = (tsc1 + tsc2) >> 1;
 #ifdef NVPPS_MAP_EQOS_REGS
 	}
-#endif /*NVPPS_MAP_EQOS_REGS*/
+#endif /* NVPPS_MAP_EQOS_REGS */
 
 #ifdef NVPPS_ARM_COUNTER_PROFILING
 	{
-	u64 	tmp;
+	u64	tmp;
 	int	i;
 	irq_tsc = __arch_counter_get_cntvct();
 	for (i = 0; i < 98; i++) {
@@ -206,12 +229,12 @@ static void nvpps_get_ts(struct nvpps_device_data *pdev_data, bool in_isr)
 	}
 		tsc = __arch_counter_get_cntvct();
 	}
-#endif /*NVPPS_ARM_COUNTER_PROFILING*/
+#endif /* NVPPS_ARM_COUNTER_PROFILING */
 
 #ifdef NVPPS_EQOS_REG_PROFILING
 	{
-	u32 	varmac_stnsr;
-	u32 	varmac_stsr;
+	u32	varmac_stnsr;
+	u32	varmac_stsr;
 	int	i;
 	irq_tsc = __arch_counter_get_cntvct();
 	for (i = 0; i < 100; i++) {
@@ -220,7 +243,7 @@ static void nvpps_get_ts(struct nvpps_device_data *pdev_data, bool in_isr)
 	}
 	tsc = __arch_counter_get_cntvct();
 	}
-#endif /*NVPPS_EQOS_REG_PROFILING*/
+#endif /* NVPPS_EQOS_REG_PROFILING */
 
 	/* get the interrupt latency */
 	if (irq_tsc) {
@@ -238,9 +261,8 @@ static void nvpps_get_ts(struct nvpps_device_data *pdev_data, bool in_isr)
 	pdev_data->phc = phc ? phc - irq_latency : phc;
 #endif /* NVPPS_ARM_COUNTER_PROFILING || NVPPS_EQOS_REG_PROFILING */
 	pdev_data->irq_latency = irq_latency;
+	pdev_data->actual_evt_mode = in_isr ? NVPPS_MODE_GPIO : NVPPS_MODE_TIMER;
 	raw_spin_unlock_irqrestore(&pdev_data->lock, flags);
-
-	/*dev_info(pdev_data->dev, "evt(%d) tsc(%llu) phc(%llu)\n", pdev_data->pps_event_id, pdev_data->tsc, pdev_data->phc);*/
 
 	/* event notification */
 	wake_up_interruptible(&pdev_data->pps_event_queue);
@@ -258,11 +280,15 @@ static irqreturn_t nvpps_gpio_isr(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
-
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,15,0)
 static void nvpps_timer_callback(unsigned long data)
 {
-	struct nvpps_device_data	*pdev_data = (struct nvpps_device_data *)data;
-
+	struct nvpps_device_data        *pdev_data = (struct nvpps_device_data *)data;
+#else /* LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0) */
+static void nvpps_timer_callback(struct timer_list *t)
+{
+        struct nvpps_device_data        *pdev_data = (struct nvpps_device_data *)from_timer(pdev_data, t, timer);
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(4,15,0) */
 	/* get timestamps for this event */
 	nvpps_get_ts(pdev_data, false);
 
@@ -286,11 +312,8 @@ static int set_mode(struct nvpps_device_data *pdev_data, u32 mode)
 				}
 				if (!pdev_data->irq_registered) {
 					/* register IRQ handler */
-					err = devm_request_irq(&pdev_data->pdev->dev,
-					pdev_data->irq, nvpps_gpio_isr,
-					IRQF_TRIGGER_RISING | IRQF_NO_THREAD,
-					"nvpps_isr", pdev_data);
-
+					err = devm_request_irq(pdev_data->dev, pdev_data->irq, nvpps_gpio_isr,
+							IRQF_TRIGGER_RISING | IRQF_NO_THREAD, "nvpps_isr", pdev_data);
 					if (err) {
 						dev_err(pdev_data->dev, "failed to acquire IRQ %d\n", pdev_data->irq);
 					} else {
@@ -303,11 +326,20 @@ static int set_mode(struct nvpps_device_data *pdev_data, u32 mode)
 			case NVPPS_MODE_TIMER:
 				if (pdev_data->irq_registered) {
 					/* unregister IRQ handler */
-					devm_free_irq(&pdev_data->pdev->dev, pdev_data->irq, pdev_data);
+					devm_free_irq(pdev_data->dev, pdev_data->irq, pdev_data);
 					pdev_data->irq_registered = false;
+					dev_info(pdev_data->dev, "removed IRQ %d for nvpps\n", pdev_data->irq);
 				}
 				if (!pdev_data->timer_inited) {
-					setup_timer(&pdev_data->timer, nvpps_timer_callback, (unsigned long)pdev_data);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
+					setup_timer(&pdev_data->timer,
+							nvpps_timer_callback,
+							(unsigned long)pdev_data);
+#else /* LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0) */
+					timer_setup(&pdev_data->timer,
+							nvpps_timer_callback,
+							0);
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0) */
 					pdev_data->timer_inited = true;
 					/* setup timer interval to 1000 msecs */
 					mod_timer(&pdev_data->timer, jiffies + msecs_to_jiffies(1000));
@@ -352,9 +384,9 @@ static long nvpps_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct nvpps_file_data		*pfile_data = (struct nvpps_file_data *)file->private_data;
 	struct nvpps_device_data	*pdev_data = pfile_data->pdev_data;
-	struct nvpps_params 		params;
-	void __user 			*uarg = (void __user *)arg;
-	int 				err;
+	struct nvpps_params		params;
+	void __user			*uarg = (void __user *)arg;
+	int				err;
 
 	switch (cmd) {
 		case NVPPS_GETVERSION: {
@@ -406,7 +438,7 @@ static long nvpps_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 		case NVPPS_GETEVENT: {
 			struct nvpps_timeevent	time_event;
-			unsigned long 		flags;
+			unsigned long		flags;
 
 			dev_dbg(pdev_data->dev, "NVPPS_GETEVENT\n");
 
@@ -422,7 +454,8 @@ static long nvpps_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 				time_event.tsc *= pdev_data->tsc_res_ns;
 			}
 			time_event.tsc_res_ns = pdev_data->tsc_res_ns;
-			time_event.evt_mode = pdev_data->evt_mode;
+			/* return the mode when the time event actually occured */
+			time_event.evt_mode = pdev_data->actual_evt_mode;
 			time_event.tsc_mode = pdev_data->tsc_mode;
 
 			err = copy_to_user(uarg, &time_event, sizeof(struct nvpps_timeevent));
@@ -430,6 +463,67 @@ static long nvpps_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 				return -EFAULT;
 			}
 
+			break;
+		}
+
+		case NVPPS_GETTIMESTAMP: {
+			struct nvpps_timestamp_struct	time_stamp;
+			u64	ns;
+			u32	reminder;
+			u64	tsc1, tsc2;
+
+			tsc1 = __arch_counter_get_cntvct();
+
+			dev_dbg(pdev_data->dev, "NVPPS_GETTIMESTAMP\n");
+
+			err = copy_from_user(&time_stamp, uarg,
+				sizeof(struct nvpps_timestamp_struct));
+			if (err)
+				return -EFAULT;
+
+			mutex_lock(&pdev_data->ts_lock);
+			switch (time_stamp.clockid) {
+			case CLOCK_REALTIME:
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
+				ktime_get_real_ts(&time_stamp.kernel_ts);
+#else /* LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0) */
+				ktime_get_real_ts64(&time_stamp.kernel_ts);
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0) */
+				break;
+
+			case CLOCK_MONOTONIC:
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
+				ktime_get_ts(&time_stamp.kernel_ts);
+#else /* LINUX_VERSION_CODE >= KERNEL_VERSION(4, 15, 0) */
+				ktime_get_ts64(&time_stamp.kernel_ts);
+#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0) */
+				break;
+
+			default:
+				dev_dbg(pdev_data->dev,
+					"ioctl: Unsupported clockid\n");
+			}
+
+			err = get_ptp_hwtime(&ns);
+			mutex_unlock(&pdev_data->ts_lock);
+			if (err) {
+				dev_dbg(pdev_data->dev,
+					"pdev_data->dev, HW PTP not running\n");
+				return err;
+			}
+			time_stamp.hw_ptp_ts.tv_sec = div_u64_rem(ns,
+							1000000000ULL,
+							&reminder);
+			time_stamp.hw_ptp_ts.tv_nsec = reminder;
+
+			tsc2 = __arch_counter_get_cntvct();
+			time_stamp.extra[0] =
+				(tsc2 - tsc1) * pdev_data->tsc_res_ns;
+
+			err = copy_to_user(uarg, &time_stamp,
+				sizeof(struct nvpps_timestamp_struct));
+			if (err)
+				return -EFAULT;
 			break;
 		}
 
@@ -489,7 +583,16 @@ static const struct file_operations nvpps_fops = {
 
 static void nvpps_dev_release(struct device *dev)
 {
+	struct nvpps_device_data	*pdev_data = dev_get_drvdata(dev);
+
+	cdev_del(&pdev_data->cdev);
+
+	mutex_lock(&s_nvpps_lock);
+	idr_remove(&s_nvpps_idr, pdev_data->id);
+	mutex_unlock(&s_nvpps_lock);
+
 	kfree(dev);
+	kfree(pdev_data);
 }
 
 
@@ -497,9 +600,9 @@ static void nvpps_dev_release(struct device *dev)
 static int nvpps_probe(struct platform_device *pdev)
 {
 	struct nvpps_device_data	*pdev_data;
-	struct device_node 		*np = pdev->dev.of_node;
-	dev_t 				devt;
-	int 				err;
+	struct device_node		*np = pdev->dev.of_node;
+	dev_t				devt;
+	int				err;
 
 	dev_info(&pdev->dev, "%s\n", __FUNCTION__);
 
@@ -508,8 +611,7 @@ static int nvpps_probe(struct platform_device *pdev)
 		return -EINVAL;
 	}
 
-	pdev_data = devm_kzalloc(&pdev->dev, sizeof(struct nvpps_device_data),
-				GFP_KERNEL);
+	pdev_data = kzalloc(sizeof(struct nvpps_device_data), GFP_KERNEL);
 	if (!pdev_data) {
 		return -ENOMEM;
 	}
@@ -546,19 +648,30 @@ static int nvpps_probe(struct platform_device *pdev)
 		}
 		pdev_data->irq = err;
 		dev_info(&pdev->dev, "gpio_to_irq(%d)\n", pdev_data->irq);
+
+		/* enable gpio interrupt timestamp */
+		err = gpio_timestamp_control(pdev_data->gpio_pin, 1);
+		if (err && (err != -EINVAL)) {
+			dev_err(pdev_data->dev, "failed to set timestamp control\n");
+			pdev_data->use_gpio_int_timesatmp = false;
+		} else {
+			pdev_data->use_gpio_int_timesatmp = true;
+			dev_info(pdev_data->dev, "enable timestamp control\n");
+		}
 	}
 
 #ifdef NVPPS_MAP_EQOS_REGS
-	/* remap base address for eqos*/
-	pdev_data->eqos_base_addr = (u64)devm_ioremap_nocache(&pdev->dev,
+	/* remap base address for eqos */
+	pdev_data->eqos_base_addr = (u64)devm_ioremap(&pdev->dev,
 		EQOS_BASE_ADDR, 4096);
 	dev_info(&pdev->dev, "map EQOS to (%p)\n", (void *)pdev_data->eqos_base_addr);
-#endif /*NVPPS_MAP_EQOS_REGS*/
+#endif /* NVPPS_MAP_EQOS_REGS */
 
 	init_waitqueue_head(&pdev_data->pps_event_queue);
 	raw_spin_lock_init(&pdev_data->lock);
+	mutex_init(&pdev_data->ts_lock);
 	pdev_data->pdev = pdev;
-	pdev_data->evt_mode = 0; /*NVPPS_MODE_GPIO*/
+	pdev_data->evt_mode = 0; /* NVPPS_MODE_GPIO */
 	pdev_data->tsc_mode = NVPPS_TSC_NSEC;
 	#define _PICO_SECS (1000000000000ULL)
 	pdev_data->tsc_res_ns = (_PICO_SECS / (u64)arch_timer_get_cntfrq()) / 1000;
@@ -590,10 +703,6 @@ static int nvpps_probe(struct platform_device *pdev)
 			err = -EBUSY;
 		}
 		mutex_unlock(&s_nvpps_lock);
-#ifndef NVPPS_NO_DT
-		unregister_chrdev_region(s_nvpps_devt, MAX_NVPPS_SOURCES);
-		class_destroy(s_nvpps_class);
-#endif
 		return err;
 	}
 	pdev_data->id = err;
@@ -617,9 +726,10 @@ static int nvpps_probe(struct platform_device *pdev)
 
 	err = cdev_add(&pdev_data->cdev, devt, 1);
 	if (err) {
-		dev_err(&pdev->dev, "nvpps: failed to add char device %d:%d\n",	MAJOR(s_nvpps_devt), pdev_data->id);
+		dev_err(&pdev->dev, "nvpps: failed to add char device %d:%d\n",
+			MAJOR(s_nvpps_devt), pdev_data->id);
 		device_destroy(s_nvpps_class, pdev_data->dev->devt);
-		goto error_ret;
+		return err;
 	}
 
 	dev_info(&pdev->dev, "nvpps cdev(%d:%d)\n", MAJOR(s_nvpps_devt), pdev_data->id);
@@ -629,22 +739,18 @@ static int nvpps_probe(struct platform_device *pdev)
 	err = set_mode(pdev_data, NVPPS_DEF_MODE);
 	if (err) {
 		dev_err(&pdev->dev, "set_mode failed err = %d\n", err);
-		cdev_del(&pdev_data->cdev);
 		device_destroy(s_nvpps_class, pdev_data->dev->devt);
-		goto error_ret;
+		return err;
 	}
 	pdev_data->evt_mode = NVPPS_DEF_MODE;
 
 	return 0;
 
 error_ret:
+	cdev_del(&pdev_data->cdev);
 	mutex_lock(&s_nvpps_lock);
 	idr_remove(&s_nvpps_idr, pdev_data->id);
 	mutex_unlock(&s_nvpps_lock);
-#ifndef NVPPS_NO_DT
-	unregister_chrdev_region(s_nvpps_devt, MAX_NVPPS_SOURCES);
-	class_destroy(s_nvpps_class);
-#endif
 	return err;
 }
 
@@ -653,29 +759,32 @@ static int nvpps_remove(struct platform_device *pdev)
 {
 	struct nvpps_device_data	*pdev_data = platform_get_drvdata(pdev);
 
-	printk("%s\n", __FUNCTION__);
+	dev_info(&pdev->dev, "%s\n", __FUNCTION__);
 
 	if (pdev_data) {
 		if (pdev_data->timer_inited) {
 			pdev_data->timer_inited = false;
 			del_timer_sync(&pdev_data->timer);
 		}
+		if (pdev_data->use_gpio_int_timesatmp) {
+			gpio_timestamp_control(pdev_data->gpio_pin, 0);
+			pdev_data->use_gpio_int_timesatmp = false;
+			dev_info(&pdev->dev, "disable timestamp control\n");
+		}
 #ifdef NVPPS_MAP_EQOS_REGS
 		if (pdev_data->eqos_base_addr) {
 			devm_iounmap(&pdev->dev, (void *)pdev_data->eqos_base_addr);
-			dev_info(&pdev->dev, "unmap EQOS reg space %p for nvpps\n", (void *)pdev_data->eqos_base_addr);
+			dev_info(&pdev->dev, "unmap EQOS reg space %p for nvpps\n",
+				(void *)pdev_data->eqos_base_addr);
 		}
-#endif /*NVPPS_MAP_EQOS_REGS*/
-		cdev_del(&pdev_data->cdev);
+#endif /* NVPPS_MAP_EQOS_REGS */
 		device_destroy(s_nvpps_class, pdev_data->dev->devt);
-		mutex_lock(&s_nvpps_lock);
-		idr_remove(&s_nvpps_idr, pdev_data->id);
-		mutex_unlock(&s_nvpps_lock);
 	}
 
 #ifndef NVPPS_NO_DT
-	unregister_chrdev_region(s_nvpps_devt, MAX_NVPPS_SOURCES);
+	class_unregister(s_nvpps_class);
 	class_destroy(s_nvpps_class);
+	unregister_chrdev_region(s_nvpps_devt, MAX_NVPPS_SOURCES);
 #endif /* !NVPPS_NO_DT */
 	return 0;
 }
@@ -684,18 +793,18 @@ static int nvpps_remove(struct platform_device *pdev)
 #ifdef CONFIG_PM
 static int nvpps_suspend(struct platform_device *pdev, pm_message_t state)
 {
-	/*struct nvpps_device_data	*pdev_data = platform_get_drvdata(pdev);*/
+	/* struct nvpps_device_data	*pdev_data = platform_get_drvdata(pdev); */
 
 	return 0;
 }
 
 static int nvpps_resume(struct platform_device *pdev)
 {
-	/*struct nvpps_device_data	*pdev_data = platform_get_drvdata(pdev);*/
+	/* struct nvpps_device_data	*pdev_data = platform_get_drvdata(pdev); */
 
 	return 0;
 }
-#endif /*CONFIG_PM*/
+#endif /* CONFIG_PM */
 
 
 #ifndef NVPPS_NO_DT
@@ -704,7 +813,7 @@ static const struct of_device_id nvpps_of_table[] = {
 	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, nvpps_of_table);
-#endif /*!NVPPS_NO_DT*/
+#endif /* !NVPPS_NO_DT */
 
 
 static struct platform_driver nvpps_plat_driver = {
@@ -713,20 +822,20 @@ static struct platform_driver nvpps_plat_driver = {
 		.owner = THIS_MODULE,
 #ifndef NVPPS_NO_DT
 		.of_match_table = of_match_ptr(nvpps_of_table),
-#endif /*!NVPPS_NO_DT*/
+#endif /* !NVPPS_NO_DT */
 	},
 	.probe = nvpps_probe,
 	.remove = nvpps_remove,
 #ifdef CONFIG_PM
 	.suspend = nvpps_suspend,
 	.resume = nvpps_resume,
-#endif /*CONFIG_PM*/
+#endif /* CONFIG_PM */
 };
 
 
 #ifdef NVPPS_NO_DT
 /* module init
-*/
+ */
 static int __init nvpps_init(void)
 {
 	int err;
@@ -753,11 +862,13 @@ static int __init nvpps_init(void)
 
 
 /* module fini
-*/
+ */
 static void __exit nvpps_exit(void)
 {
 	printk("%s\n", __FUNCTION__);
 	platform_driver_unregister(&nvpps_plat_driver);
+
+	class_unregister(s_nvpps_class);
 	class_destroy(s_nvpps_class);
 	unregister_chrdev_region(s_nvpps_devt, MAX_NVPPS_SOURCES);
 }

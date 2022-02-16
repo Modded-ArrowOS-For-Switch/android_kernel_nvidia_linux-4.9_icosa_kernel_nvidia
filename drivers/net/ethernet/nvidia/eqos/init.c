@@ -30,7 +30,7 @@
  * =========================================================================
  */
 /*
- * Copyright (c) 2015-2021, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2015-2020, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -54,7 +54,12 @@
 #include <linux/regulator/consumer.h>
 #include <linux/of_device.h>
 #include <linux/of_gpio.h>
+#include <linux/version.h>
+#if KERNEL_VERSION(4, 15, 0) > LINUX_VERSION_CODE
 #include <soc/tegra/chip-id.h>
+#else
+#include <soc/tegra/fuse.h>
+#endif
 #include <linux/clk.h>
 #include <linux/reset.h>
 #include <linux/gpio.h>
@@ -102,9 +107,6 @@ irqreturn_t EQOS_ISR_SW_EQOS_POWER(int irq, void *device_id)
 	ULONG mac_imr;
 	ULONG mac_pmtcsr;
 	ULONG clk_ctrl = 0;
-
-	if (tegra_platform_is_unit_fpga())
-		CLK_CRTL0_RD(clk_ctrl);
 
 	if (clk_ctrl & BIT(31)) {
 		pr_debug("power_isr: phy_intr received\n");
@@ -159,14 +161,16 @@ void get_dt_u32(struct eqos_prv_data *pdata, char *pdt_prop, u32 *pval,
 
 	ret = of_property_read_u32(pnode, pdt_prop, pval);
 
-	if (ret < 0)
-		dev_err(&pdata->pdev->dev,
-			"%s(): \"%s\" read failed %d. Using default\n",
+	if (ret < 0) {
+		dev_info(&pdata->pdev->dev,
+			 "%s(): \"%s\" read failed %d. Using default\n",
 			__func__, pdt_prop, ret);
+		*pval = val_def;
+	}
 
 	if (*pval > val_max) {
-		dev_err(&pdata->pdev->dev,
-			"%s(): %d is invalid value for \"%s\".  Using default.\n",
+		dev_info(&pdata->pdev->dev,
+			 "%s(): %d is invalid value for \"%s\".  Using default.\n",
 			__func__, *pval, pdt_prop);
 		*pval = val_def;
 	}
@@ -883,128 +887,6 @@ static void eqos_get_phy_delays(struct eqos_prv_data *pdata)
 		pdata->phy_reset_post_delay = 0;
 }
 
-static enum hrtimer_restart eqos_tx_usecs_hrtimer(struct hrtimer *data)
-{
-	struct eqos_tx_queue *tx_queue = container_of(data,
-			struct eqos_tx_queue,
-			tx_usecs_timer);
-	struct eqos_prv_data *pdata = tx_queue->pdata;
-
-	pdata->xstats.tx_usecs_swtimer_n[tx_queue->chan_num]++;
-
-	atomic_set(&tx_queue->tx_usecs_timer_armed,
-		   EQOS_HRTIMER_DISABLE);
-	if (likely(napi_schedule_prep(&tx_queue->napi)))
-		 __napi_schedule_irqoff(&tx_queue->napi);
-
-	return HRTIMER_NORESTART;
-}
-
-static int eqos_read_coalesc_params(struct platform_device *pdev,
-				    struct eqos_prv_data *pdata,
-				    struct device_node *np)
-{
-	int ret, i;
-	u32 tx_usecs, rx_riwt, tx_frames, rx_frames;
-	bool use_tx_usecs = EQOS_COAELSCING_DISABLE;
-	bool use_tx_frames = EQOS_COAELSCING_DISABLE;
-	bool use_riwt = EQOS_COAELSCING_DISABLE;
-	bool use_rx_frames = EQOS_COAELSCING_DISABLE;
-
-	/* tx_usecs value to be set */
-	ret = of_property_read_u32(np, "nvidia,tx_usecs", &tx_usecs);
-	if (ret < 0) {
-		use_tx_usecs = EQOS_COAELSCING_DISABLE;
-	} else {
-		if (tx_usecs > EQOS_MAX_TX_COALESCE_USEC ||
-		    tx_usecs < EQOS_MIN_TX_COALESCE_USEC) {
-			dev_err(&pdev->dev,
-				"invalid tx_riwt, must be in range %d to %d\n",
-				EQOS_MIN_TX_COALESCE_USEC,
-				EQOS_MAX_TX_COALESCE_USEC);
-			return -EINVAL;
-		}
-		use_tx_usecs = EQOS_COAELSCING_ENABLE;
-	}
-
-	/* tx_frames value to be set */
-	ret = of_property_read_u32(np, "nvidia,tx_frames", &tx_frames);
-	if (ret < 0) {
-		use_tx_frames = EQOS_COAELSCING_DISABLE;
-	} else {
-		if (tx_frames > EQOS_TX_MAX_FRAME ||
-		    tx_frames < EQOS_MIN_TX_COALESCE_FRAMES) {
-			dev_err(&pdev->dev,
-				"invalid tx-frames, must be in range %d to %ld",
-				EQOS_MIN_TX_COALESCE_FRAMES,
-				EQOS_TX_MAX_FRAME);
-			return -EINVAL;
-		}
-		use_tx_frames = EQOS_COAELSCING_ENABLE;
-	}
-
-	if (use_tx_usecs == EQOS_COAELSCING_DISABLE &&
-	    use_tx_frames == EQOS_COAELSCING_ENABLE) {
-		dev_err(&pdev->dev, "invalid settings : tx_frames must be enabled along with tx_usecs in DT\n");
-		return -EINVAL;
-	}
-
-	/* RIWT value to be set */
-	ret = of_property_read_u32(np, "nvidia,rx_riwt", &rx_riwt);
-	if (ret < 0) {
-		use_riwt = EQOS_COAELSCING_DISABLE;
-	} else {
-		if ((rx_riwt > EQOS_MAX_RX_COALESCE_USEC) ||
-		    (rx_riwt < EQOS_MIN_RX_COALESCE_USEC)) {
-			dev_err(&pdev->dev,
-				"invalid rx_riwt, must be inrange %d to %d\n",
-				EQOS_MIN_RX_COALESCE_USEC,
-				EQOS_MAX_RX_COALESCE_USEC);
-			return -EINVAL;
-		}
-		use_riwt = EQOS_COAELSCING_ENABLE;
-	}
-
-	/* rx_frames value to be set */
-	ret = of_property_read_u32(np, "nvidia,rx_frames", &rx_frames);
-	if (ret < 0) {
-		use_rx_frames = EQOS_COAELSCING_DISABLE;
-	} else {
-		if (rx_frames > RX_DESC_CNT ||
-		    rx_frames < EQOS_MIN_RX_COALESCE_FRAMES) {
-			dev_err(&pdev->dev,
-				"invalid rx-frames, must be inrange %d to %d",
-				EQOS_MIN_RX_COALESCE_FRAMES, RX_DESC_CNT);
-			return -EINVAL;
-		}
-		use_rx_frames = EQOS_COAELSCING_ENABLE;
-	}
-
-	/*  On Rx side we support Rx_usecs and Rx-frames together only  */
-	if ((use_riwt == EQOS_COAELSCING_DISABLE &&
-	     use_rx_frames == EQOS_COAELSCING_ENABLE) ||
-	    (use_riwt == EQOS_COAELSCING_ENABLE &&
-	     use_rx_frames == EQOS_COAELSCING_DISABLE)) {
-		dev_err(&pdev->dev,
-			"invalid settings : rx-frames must be enabled along with use_riwt in DT\n");
-		return -EINVAL;
-	}
-
-	for (i = 0; i < pdata->num_chans; i++) {
-		pdata->tx_queue[i].ptx_ring.tx_coal_frames = tx_frames;
-		pdata->tx_queue[i].ptx_ring.use_tx_frames = use_tx_frames;
-		pdata->tx_queue[i].ptx_ring.use_tx_usecs = use_tx_usecs;
-		pdata->tx_queue[i].ptx_ring.tx_usecs = tx_usecs;
-	}
-	for (i = 0; i < pdata->num_chans; i++) {
-		pdata->rx_queue[i].prx_ring.rx_coal_frames = rx_frames;
-		pdata->rx_queue[i].prx_ring.use_riwt = use_riwt;
-		pdata->rx_queue[i].prx_ring.rx_riwt = rx_riwt;
-	}
-
-	return 0;
-}
-
 /*!
 * \brief API to initialize the device.
 *
@@ -1036,8 +918,7 @@ int eqos_probe(struct platform_device *pdev)
 	u8 mac_addr[6];
 	struct eqos_cfg *pdt_cfg;
 	bool	use_multi_q;
-	uint	phyrst_lp_mode;
-	uint	num_chans, chan;
+	uint	num_chans;
 
 	pr_debug("-->%s()\n", __func__);
 
@@ -1101,7 +982,7 @@ int eqos_probe(struct platform_device *pdev)
 	pr_debug("============================================================\n");
 
 	/* remap base address */
-	eqos_base_addr = (ULONG) devm_ioremap_nocache(&pdev->dev,
+	eqos_base_addr = (ULONG) devm_ioremap(&pdev->dev,
 		res->start, (res->end - res->start) + 1);
 
 	/* Set DMA addressing limitations */
@@ -1135,6 +1016,11 @@ int eqos_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, ndev);
 	pdata->pdev = pdev;
+	get_dt_u32(pdata, "nvidia,max-platform-mtu", &pdata->max_platform_mtu,
+		   EQOS_DEFAULT_PLATFORM_MTU, EQOS_MAX_HW_MTU);
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 14, 0)
+	ndev->max_mtu = pdata->max_platform_mtu;
+#endif
 
 	pdata->dev = ndev;
 
@@ -1146,66 +1032,65 @@ int eqos_probe(struct platform_device *pdev)
 
 	pdata->num_chans = num_chans;
 	/* PMT and PHY irqs are shared on FPGA system */
-	if (tegra_platform_is_unit_fpga()) {
-		phyirq = power_irq;
-		/* issue sw reset to device */
-		hw_if->exit();
-	} else {
-		/* regulator init */
-		ret = eqos_regulator_init(pdata);
-		if (ret < 0) {
-			dev_err(&pdev->dev,
-				"failed to enable regulator %d\n", ret);
-			goto err_out_regulator_en_failed;
-		}
-
-		/* On silicon the phy_intr line is handled through a wake
-		 * capable GPIO input. DMIC4_CLK is the GPIO input port.
-		 */
-		phyirq = eqos_get_phyirq_from_gpio(pdata);
-		if (phyirq < 0)
-			phyirq = PHY_POLL;
-
-		/* read phy delays from DT */
-		eqos_get_phy_delays(pdata);
-
-		/* setup PHY reset gpio */
-		eqos_get_phyreset_from_gpio(pdata);
-		if (gpio_is_valid(pdata->phy_reset_gpio)) {
-			/* reset Broadcom PHY needs minimum of 2us delay */
-			gpio_set_value(pdata->phy_reset_gpio, 0);
-			usleep_range(pdata->phy_reset_duration,
-				     pdata->phy_reset_duration + 1);
-			gpio_set_value(pdata->phy_reset_gpio, 1);
-			msleep(pdata->phy_reset_post_delay);
-		}
-
-		/* CAR reset */
-		pdata->eqos_rst =
-			devm_reset_control_get(&pdev->dev, "eqos_rst");
-		if (IS_ERR_OR_NULL(pdata->eqos_rst)) {
-			ret = PTR_ERR(pdata->eqos_rst);
-			dev_err(&pdev->dev,
-				"failed to get eqos reset %d\n", ret);
-			goto err_out_reset_get_failed;
-		}
-
-		/* clock initialization */
-		ret = eqos_get_clocks(pdata);
-		if (ret < 0) {
-			dev_err(&pdev->dev, "eqos_clock_init failed\n");
-			goto err_out_clock_init_failed;
-		}
-
-		ret = eqos_clock_enable(pdata);
-		if (ret < 0) {
-			dev_err(&pdev->dev, "eqos_clock_enable failed\n");
-			goto err_out_clock_init_failed;
-		}
-
-		/* issue CAR reset to device */
-		hw_if->car_reset(pdata);
+	/* regulator init */
+	ret = eqos_regulator_init(pdata);
+	if (ret < 0) {
+		dev_err(&pdev->dev,
+			"failed to enable regulator %d\n", ret);
+		goto err_out_regulator_en_failed;
 	}
+
+	/* On silicon the phy_intr line is handled through a wake
+	 * capable GPIO input. DMIC4_CLK is the GPIO input port.
+	 */
+	phyirq = eqos_get_phyirq_from_gpio(pdata);
+	if (phyirq < 0) {
+		dev_info(&pdev->dev, "no PHY interrupt found\n");
+		phyirq = PHY_POLL;
+	}
+
+	/* read phy delays from DT */
+	eqos_get_phy_delays(pdata);
+
+	/* setup PHY reset gpio */
+	ret = eqos_get_phyreset_from_gpio(pdata);
+	if (ret < 0)
+		dev_info(&pdev->dev, "no PHY reset gpio found\n");
+
+	if (gpio_is_valid(pdata->phy_reset_gpio)) {
+		/* reset Broadcom PHY needs minimum of 2us delay */
+		gpio_set_value(pdata->phy_reset_gpio, 0);
+		usleep_range(pdata->phy_reset_duration,
+			     pdata->phy_reset_duration + 1);
+		gpio_set_value(pdata->phy_reset_gpio, 1);
+		msleep(pdata->phy_reset_post_delay);
+	}
+
+	/* CAR reset */
+	pdata->eqos_rst =
+		devm_reset_control_get(&pdev->dev, "eqos_rst");
+	if (IS_ERR_OR_NULL(pdata->eqos_rst)) {
+		ret = PTR_ERR(pdata->eqos_rst);
+		dev_err(&pdev->dev,
+			"failed to get eqos reset %d\n", ret);
+		goto err_out_reset_get_failed;
+	}
+
+	/* clock initialization */
+	ret = eqos_get_clocks(pdata);
+	if (ret < 0) {
+		dev_err(&pdev->dev, "eqos_clock_init failed\n");
+		goto err_out_clock_init_failed;
+	}
+
+	ret = eqos_clock_enable(pdata);
+	if (ret < 0) {
+		dev_err(&pdev->dev, "eqos_clock_enable failed\n");
+		goto err_out_clock_init_failed;
+	}
+
+	/* issue CAR reset to device */
+	hw_if->car_reset(pdata);
 	pr_debug("phyirq = %d\n", phyirq);
 
 	pdata->prod_list = devm_tegra_prod_get(&pdev->dev);
@@ -1218,15 +1103,6 @@ int eqos_probe(struct platform_device *pdev)
 					   pdata->prod_list))
 			dev_info(&pdev->dev,
 				 "fail to enable eqos pad ctrl prod settings\n");
-	}
-	/* set the pad auto calibration reg settings value as per
-	 * recommended values from BUG:3112028
-	 */
-	ret = of_property_read_u32(node, "nvidia,eqos_auto_cal_config_0_reg",
-			&(pdata->dt_cfg.reg_auto_cal_config_0_val));
-	if (ret < 0) {
-		dev_info(&pdev->dev, "failed to read eqos_auto_cal_config_0_reg\n");
-		pdata->dt_cfg.reg_auto_cal_config_0_val = 0x0;
 	}
 
 	/* calibrate pad */
@@ -1265,12 +1141,6 @@ int eqos_probe(struct platform_device *pdev)
 		goto err_out_q_alloc_failed;
 	}
 
-	ret = eqos_read_coalesc_params(pdev, pdata, node);
-	if (ret) {
-		pr_err("Coalescing parameters incorrect\n");
-		goto err_out_q_alloc_failed;
-	}
-
 	ndev->netdev_ops = eqos_get_netdev_ops();
 
 	pdata->dt_cfg.use_multi_q = use_multi_q;
@@ -1304,10 +1174,13 @@ int eqos_probe(struct platform_device *pdev)
 	eqos_get_slot_num_check_queues(pdata, pdt_cfg->slot_num_check);
 
 #ifndef DISABLE_TRISTATE
-	/* enable tx tri state to save power during init */
-	ret = pinctrl_pm_select_idle_state(&pdev->dev);
-	if (ret < 0)
-		dev_err(&pdev->dev, "enable txrx trisate failed(%d)\n", ret);
+	if (pdata->mac_ver == EQOS_MAC_CORE_4_10) {
+		/* enable tx tri state to save power during init */
+		ret = pinctrl_pm_select_idle_state(&pdev->dev);
+		if (ret < 0)
+			dev_err(&pdev->dev, "setting tx_tristate_enable \
+					state failed with %d\n", ret);
+	}
 #endif
 	pdata->rx_buffer_len = EQOS_RX_BUF_LEN;
 	pdata->rx_max_frame_size = EQOS_MAX_ETH_FRAME_LEN_DEFAULT;
@@ -1346,7 +1219,13 @@ int eqos_probe(struct platform_device *pdev)
 		ndev->dev_addr[4] = mac_addr[4];
 		ndev->dev_addr[5] = mac_addr[5];
 	}
+#if KERNEL_VERSION(5, 5, 0) > LINUX_VERSION_CODE
 	pdata->interface = of_get_phy_mode(node);
+#else
+	ret = of_get_phy_mode(node, &pdata->interface);
+	if (ret < 0)
+		pr_debug("%s(): phy interface not found\n", __func__);
+#endif
 
 	pdata->phy_node = of_parse_phandle(node, "phy-handle", 0);
 	if (!pdata->phy_node)
@@ -1371,20 +1250,6 @@ int eqos_probe(struct platform_device *pdev)
 		pdata->phy_node = of_node_get(node);
 	}
 
-	/* Read the supported phy low power mode for the attached phy.
-	 * Default is to put phy in reset mode, if not set then use the
-	 * low power mode supported by the particular phy chip.
-	 */
-	ret = of_property_read_u32(pdata->phy_node, "phy_rst_lp_mode",
-				   &phyrst_lp_mode);
-	if (ret < 0) {
-		pr_info("Using default phy reset low power mode\n");
-		pdata->dt_cfg.phyrst_lpmode = 1U;
-	} else {
-		pr_info("Using phyrst_lpmode = %d from DT\n", phyrst_lp_mode);
-		pdata->dt_cfg.phyrst_lpmode = phyrst_lp_mode ? 1U : 0U;
-	}
-
 	if (pdata->mdio_node) {
 		ret = eqos_mdio_register(ndev);
 		if (ret < 0) {
@@ -1406,16 +1271,6 @@ int eqos_probe(struct platform_device *pdev)
 			       eqos_napi_poll_tx, pdt_cfg->chan_napi_quota[i]);
 	}
 
-	/* Setup the tx_usecs timer */
-	for (i = 0; i < pdata->num_chans; i++) {
-		chan = pdata->tx_queue[i].chan_num;
-		atomic_set(&pdata->tx_queue[chan].tx_usecs_timer_armed,
-			   EQOS_HRTIMER_DISABLE);
-		hrtimer_init(&pdata->tx_queue[chan].tx_usecs_timer,
-			     CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-		pdata->tx_queue[chan].tx_usecs_timer.function =
-					eqos_tx_usecs_hrtimer;
-	}
 	ndev->ethtool_ops = (eqos_get_ethtool_ops());
 
 	if (pdata->hw_feat.tso_en) {
@@ -1470,17 +1325,6 @@ int eqos_probe(struct platform_device *pdev)
 
 	netif_carrier_off(ndev);
 
-	if (tegra_platform_is_unit_fpga()) {
-		ret = request_irq(power_irq, EQOS_ISR_SW_EQOS_POWER,
-			IRQF_SHARED, DEV_NAME, pdata);
-
-		if (ret != 0) {
-			pr_err("Unable to register PMT IRQ %d\n", power_irq);
-			ret = -EBUSY;
-			goto err_out_pmt_irq_failed;
-		}
-	}
-
 	INIT_WORK(&pdata->fbe_work, eqos_fbe_work);
 	INIT_WORK(&pdata->iso_work, eqos_iso_work);
 
@@ -1492,7 +1336,7 @@ int eqos_probe(struct platform_device *pdev)
 		if (!pdata->isomgr_handle) {
 			dev_err(&pdata->pdev->dev, "EQOS ISO Bandwidth allocation failed\n");
 			ret = -EIO;
-			goto err_isomgr_reg_failed;
+			goto err_out_pmt_irq_failed;
 		}
 	}
 
@@ -1504,12 +1348,10 @@ int eqos_probe(struct platform_device *pdev)
 	}
 
 	eqos_clock_disable(pdata);
-	/* keep initial settings as restore disabled */
-	pdata->wolopts = 0;
 
 	/* put Ethernet PHY in reset for power save */
 	if (gpio_is_valid(pdata->phy_reset_gpio) &&
-	    (pdata->dt_cfg.phyrst_lpmode == 1U))
+	    (pdata->mac_ver > EQOS_MAC_CORE_4_10))
 		gpio_set_value(pdata->phy_reset_gpio, 0);
 
 	return 0;
@@ -1517,13 +1359,6 @@ int eqos_probe(struct platform_device *pdev)
  err_therm_init:
 	if (pdt_cfg->eth_iso_enable)
 		tegra_isomgr_unregister(pdata->isomgr_handle);
-
- err_isomgr_reg_failed:
-	if ((tegra_platform_is_unit_fpga()) &&
-		(pdata->power_irq != 0)) {
-		free_irq(pdata->power_irq, pdata);
-		pdata->power_irq = 0;
-	}
 
  err_out_pmt_irq_failed:
 	unregister_netdev(ndev);
@@ -1543,16 +1378,13 @@ int eqos_probe(struct platform_device *pdev)
 
  err_out_q_alloc_failed:
  err_out_pad_calibrate_failed:
-	if (!tegra_platform_is_unit_fpga())
-		eqos_clock_deinit(pdata);
+	eqos_clock_deinit(pdata);
  err_out_clock_init_failed:
-	if (!tegra_platform_is_unit_fpga() &&
-		!IS_ERR_OR_NULL(pdata->eqos_rst)) {
+	if (!IS_ERR_OR_NULL(pdata->eqos_rst)) {
 		reset_control_assert(pdata->eqos_rst);
 	}
  err_out_reset_get_failed:
-	if (!tegra_platform_is_unit_fpga())
-		eqos_regulator_deinit(pdata);
+	eqos_regulator_deinit(pdata);
  err_out_regulator_en_failed:
 	free_netdev(ndev);
 	platform_set_drvdata(pdev, NULL);
@@ -1604,12 +1436,6 @@ int eqos_remove(struct platform_device *pdev)
 	/* free tx skb's */
 	desc_if->tx_skb_free_mem(pdata, EQOS_TX_QUEUE_CNT);
 
-	if ((tegra_platform_is_unit_fpga()) &&
-	    (pdata->power_irq != 0)) {
-		free_irq(pdata->power_irq, pdata);
-		pdata->power_irq = 0;
-	}
-
 	if (pdt_cfg->eth_iso_enable)
 		tegra_isomgr_unregister(pdata->isomgr_handle);
 
@@ -1630,15 +1456,13 @@ int eqos_remove(struct platform_device *pdev)
 
 	desc_if->free_queue_struct(pdata);
 
-	if (!tegra_platform_is_unit_fpga()) {
-		eqos_clock_deinit(pdata);
+	eqos_clock_deinit(pdata);
 
-		if (!IS_ERR_OR_NULL(pdata->eqos_rst))
-			reset_control_assert(pdata->eqos_rst);
-		devm_gpio_free(&pdev->dev, pdata->phy_reset_gpio);
-		devm_gpio_free(&pdev->dev, pdata->phy_intr_gpio);
-		eqos_regulator_deinit(pdata);
-	}
+	if (!IS_ERR_OR_NULL(pdata->eqos_rst))
+		reset_control_assert(pdata->eqos_rst);
+	devm_gpio_free(&pdev->dev, pdata->phy_reset_gpio);
+	devm_gpio_free(&pdev->dev, pdata->phy_intr_gpio);
+	eqos_regulator_deinit(pdata);
 
 	free_netdev(ndev);
 
@@ -1672,11 +1496,10 @@ static int eqos_suspend_noirq(struct device *dev)
 			enable_irq_wake(pdata->phydev->irq);
 		} else {
 			phy_stop(pdata->phydev);
-			if (gpio_is_valid(pdata->phy_reset_gpio) &&
-			    (pdata->dt_cfg.phyrst_lpmode == 1U)) {
+			if (gpio_is_valid(pdata->phy_reset_gpio)) {
 				gpio_set_value(pdata->phy_reset_gpio, 0);
 				usleep_range(pdata->phy_reset_duration,
-					     pdata->phy_reset_duration + 1);
+					pdata->phy_reset_duration + 1);
 			}
 		}
 	}
@@ -1736,10 +1559,9 @@ static int eqos_resume_noirq(struct device *dev)
 		}
 		eqos_start_dev(pdata);
 	} else {
-		if (gpio_is_valid(pdata->phy_reset_gpio)) {
-			/* reset Broadcom PHY needs minimum of 2us delay */
-			gpio_set_value(pdata->phy_reset_gpio, 0);
-			usleep_range(10, 11);
+		if (gpio_is_valid(pdata->phy_reset_gpio) &&
+		    !gpio_get_value(pdata->phy_reset_gpio)) {
+			/* deassert phy reset */
 			gpio_set_value(pdata->phy_reset_gpio, 1);
 			msleep(pdata->phy_reset_post_delay);
 		}
@@ -1756,19 +1578,6 @@ static int eqos_resume_noirq(struct device *dev)
 		/* Init the PHY */
 		pdata->phydev->drv->config_init(pdata->phydev);
 		phy_start(pdata->phydev);
-	}
-
-	/* restore wake on lan settings if already enabled */
-	if (pdata->wolopts) {
-		struct ethtool_wolinfo wol = { .cmd = ETHTOOL_SWOL };
-
-		wol.wolopts = WAKE_MAGIC;
-		/* set the WoL bit */
-		ret = phy_ethtool_set_wol(pdata->phydev, &wol);
-		if (ret < 0) {
-			dev_err(&pdata->pdev->dev, "WoL set failed\n");
-			return ret;
-		}
 	}
 
 	netif_tx_start_all_queues(pdata->dev);

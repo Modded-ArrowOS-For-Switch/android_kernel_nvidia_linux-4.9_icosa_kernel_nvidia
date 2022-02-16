@@ -14,7 +14,6 @@
  * GNU General Public License for more details.
  *
  */
-#include <linux/pm_runtime.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/err.h>
@@ -32,7 +31,7 @@
 #include "dc_common.h"
 #include "nvhost_channel.h"
 #include "nvhost_job.h"
-#include "host1x/host1x03_hardware.h"
+#include "host1x/host1x04_hardware.h"
 #include <trace/events/display.h>
 
 #define CMDBUF_SIZE		128
@@ -116,7 +115,8 @@
 
 #ifdef CONFIG_OF
 static struct of_device_id tegra_display_common_of_match[] = {
-	{.compatible = "nvidia,tegra_dc_common", },
+	{.compatible = "nvidia,tegra186-display", },
+	{.compatible = "nvidia,tegra194-display", },
 	{ },
 };
 #endif
@@ -1116,7 +1116,11 @@ static int tegra_dc_common_probe(struct platform_device *pdev)
 
 	ret = nvhost_channel_map(pdata, &dc_common->channel, pdata);
 	if (ret) {
-		dev_err(&pdev->dev, "Nvhost Channel map failed\n");
+		if (ret == -EPROBE_DEFER) {
+			dev_info(&pdev->dev, "Nvhost Channel map failed\n");
+		} else {
+			dev_err(&pdev->dev, "Nvhost Channel map failed\n");
+		}
 		goto err_iounmap_reg;
 	}
 	dev_info(&pdev->dev, "host1x channel mapped\n");
@@ -1164,8 +1168,6 @@ static int tegra_dc_common_probe(struct platform_device *pdev)
 		goto err_free_upd_val;
 	}
 
-	pm_runtime_enable(&pdev->dev);
-
 	tegra_dc_common_create_debugfs(dc_common);
 
 	probe_success = true;
@@ -1173,7 +1175,7 @@ static int tegra_dc_common_probe(struct platform_device *pdev)
 	return 0;
 
 err_free_upd_val:
-	kfree(dc_common->upd_val);
+	devm_kfree(&pdev->dev, dc_common->upd_val);
 err_syncpt_drop:
 	nvhost_syncpt_put_ref_ext(pdev, dc_common->syncpt_id);
 err_drop_channel:
@@ -1181,9 +1183,9 @@ err_drop_channel:
 err_iounmap_reg:
 	iounmap(dc_common->base);
 err_free:
-	kfree(pdata);
+	devm_kfree(&pdev->dev, pdata);
 err_free_dc_common:
-	kfree(dc_common);
+	devm_kfree(&pdev->dev, dc_common);
 	return ret;
 }
 

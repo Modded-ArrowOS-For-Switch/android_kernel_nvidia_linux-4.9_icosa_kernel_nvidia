@@ -197,9 +197,13 @@ static void tegra210_admaif_stop_capture(struct snd_soc_dai *dai)
 static int tegra210_admaif_trigger(struct snd_pcm_substream *substream, int cmd,
 				 struct snd_soc_dai *dai)
 {
-	pr_info("Pcm trigger for admaif%d %s: cmd_id %d\n", dai->id+1,
-		(substream->stream == SNDRV_PCM_STREAM_PLAYBACK) ?
-		"playback":"capture", cmd);
+	int err;
+	pr_info("Pcm trigger for admaif %d : cmd_id %d\n", dai->id + 1, cmd);
+
+	err = snd_dmaengine_pcm_trigger(substream, cmd);
+	if (err)
+		return err;
+
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
@@ -239,7 +243,6 @@ static struct snd_soc_dai_ops tegra210_admaif_dai_ops = {
 
 static int tegra210_admaif_dai_probe(struct snd_soc_dai *dai)
 {
-
 	dai->capture_dma_data = &admaif->capture_dma_data[dai->id];
 	dai->playback_dma_data = &admaif->playback_dma_data[dai->id];
 
@@ -919,10 +922,10 @@ int tegra210_virt_admaif_register_component(struct platform_device *pdev,
 		ARRAY_SIZE(tegra_virt_t186ref_controls) - NUM_META_CONTROLS;
 	}
 
-	ret = snd_soc_register_component(&pdev->dev,
+	ret = tegra_register_component(&pdev->dev,
 					&tegra210_admaif_dai_driver,
 					tegra210_admaif_dais,
-					soc_data->num_ch);
+					soc_data->num_ch, "admaif");
 	if (ret) {
 		dev_err(&pdev->dev, "Could not register DAIs %d: %d\n",
 			i, ret);

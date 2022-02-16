@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2018, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2014-2021, NVIDIA CORPORATION. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -18,31 +18,32 @@
 #include <linux/of_fdt.h>
 #include <linux/of_platform.h>
 #include <linux/nvmap.h>
-#include <linux/tegra-ivc.h>
-#include <linux/dma-contiguous.h>
 #include <linux/version.h>
+#include <linux/kmemleak.h>
+#include <linux/io.h>
+
+#if defined(NVMAP_LOADABLE_MODULE)
+#include <linux/nvmap_t19x.h>
+#endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
 #include <linux/sched/clock.h>
 #endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
 #include <linux/cma.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+#include <linux/dma-map-ops.h>
+#else
+#include <linux/dma-contiguous.h>
+#include <asm/dma-contiguous.h>
 #endif
 
-#include <asm/dma-contiguous.h>
-
 #include "nvmap_priv.h"
-#include "iomap.h"
-#include "board.h"
 #include <linux/platform/tegra/common.h>
 
 #ifdef CONFIG_TEGRA_VIRTUALIZATION
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
+#include <linux/tegra-ivc.h>
 #include <soc/tegra/virt/syscalls.h>
-#else
-#include "../../../drivers/virt/tegra/syscalls.h"
-#endif
 #endif
 
 phys_addr_t __weak tegra_carveout_start;
@@ -57,21 +58,16 @@ struct device __weak tegra_generic_dev;
 struct device __weak tegra_vpr_dev;
 EXPORT_SYMBOL(tegra_vpr_dev);
 
-struct device __weak tegra_iram_dev;
 struct device __weak tegra_generic_cma_dev;
 struct device __weak tegra_vpr_cma_dev;
+
+#ifdef CONFIG_TEGRA_VPR
 struct dma_resize_notifier_ops __weak vpr_dev_ops;
 
-__weak const struct of_device_id nvmap_of_ids[] = {
-	{ .compatible = "nvidia,carveouts" },
-	{ .compatible = "nvidia,carveouts-t18x" },
-	{ }
-};
-
 static struct dma_declare_info generic_dma_info = {
-	.name = "generic",
-	.size = 0,
-	.notifier.ops = NULL,
+        .name = "generic",
+        .size = 0,
+        .notifier.ops = NULL,
 };
 
 static struct dma_declare_info vpr_dma_info = {
@@ -79,42 +75,51 @@ static struct dma_declare_info vpr_dma_info = {
 	.size = SZ_32M,
 	.notifier.ops = &vpr_dev_ops,
 };
+#endif
+
+__weak const struct of_device_id nvmap_of_ids[] = {
+        { .compatible = "nvidia,carveouts" },
+        { .compatible = "nvidia,carveouts-t18x" },
+        { }
+};
 
 static struct nvmap_platform_carveout nvmap_carveouts[] = {
 	[0] = {
-		.name		= "iram",
-		.usage_mask	= NVMAP_HEAP_CARVEOUT_IRAM,
-		.base		= 0,
-		.size		= 0,
-		.dma_dev	= &tegra_iram_dev,
-		.disable_dynamic_dma_map = true,
-	},
-	[1] = {
 		.name		= "generic-0",
 		.usage_mask	= NVMAP_HEAP_CARVEOUT_GENERIC,
 		.base		= 0,
 		.size		= 0,
 		.dma_dev	= &tegra_generic_dev,
 		.cma_dev	= &tegra_generic_cma_dev,
+#ifdef CONFIG_TEGRA_VPR
 		.dma_info	= &generic_dma_info,
+#endif
 	},
-	[2] = {
+	[1] = {
 		.name		= "vpr",
 		.usage_mask	= NVMAP_HEAP_CARVEOUT_VPR,
 		.base		= 0,
 		.size		= 0,
 		.dma_dev	= &tegra_vpr_dev,
 		.cma_dev	= &tegra_vpr_cma_dev,
+#ifdef CONFIG_TEGRA_VPR
 		.dma_info	= &vpr_dma_info,
+#endif
 		.enable_static_dma_map = true,
 	},
-	[3] = {
+	[2] = {
 		.name		= "vidmem",
 		.usage_mask	= NVMAP_HEAP_CARVEOUT_VIDMEM,
 		.base		= 0,
 		.size		= 0,
 		.disable_dynamic_dma_map = true,
 		.no_cpu_access = true,
+	},
+	[3] = {
+		.name		= "fsi",
+		.usage_mask	= NVMAP_HEAP_CARVEOUT_FSI,
+		.base		= 0,
+		.size		= 0,
 	},
 	/* Need uninitialized entries for IVM carveouts */
 	[4] = {
@@ -288,6 +293,96 @@ static int __nvmap_init_dt(struct platform_device *pdev)
 	return 0;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
+static void nvmap_dma_release_coherent_memory(struct dma_coherent_mem_replica *mem)
+{
+	if (!mem)
+		return;
+	if (!(mem->flags & DMA_MEMORY_NOMAP))
+		memunmap(mem->virt_base);
+	kfree(mem->bitmap);
+	kfree(mem);
+}
+
+static int nvmap_dma_assign_coherent_memory(struct device *dev,
+				      struct dma_coherent_mem_replica *mem)
+{
+	if (!dev)
+		return -ENODEV;
+
+	if (dev->dma_mem)
+		return -EBUSY;
+
+	dev->dma_mem = (struct dma_coherent_mem *)mem;
+	return 0;
+}
+
+static int nvmap_dma_init_coherent_memory(
+	phys_addr_t phys_addr, dma_addr_t device_addr, size_t size, int flags,
+	struct dma_coherent_mem_replica **mem)
+{
+	struct dma_coherent_mem_replica *dma_mem = NULL;
+	void __iomem *mem_base = NULL;
+	int pages = size >> PAGE_SHIFT;
+	int bitmap_size = BITS_TO_LONGS(pages) * sizeof(long);
+	int ret;
+
+	if (!size)
+		return -EINVAL;
+
+	if (!(flags & DMA_MEMORY_NOMAP)) {
+		mem_base = memremap(phys_addr, size, MEMREMAP_WC);
+		if (!mem_base)
+			return -EINVAL;
+	}
+
+	dma_mem = kzalloc(sizeof(struct dma_coherent_mem_replica), GFP_KERNEL);
+	if (!dma_mem) {
+		ret = -ENOMEM;
+		goto err_memunmap;
+	}
+
+	dma_mem->bitmap = kzalloc(bitmap_size, GFP_KERNEL);
+	if (!dma_mem->bitmap) {
+		ret = -ENOMEM;
+		goto err_free_dma_mem;
+	}
+
+	dma_mem->virt_base = mem_base;
+	dma_mem->device_base = device_addr;
+	dma_mem->pfn_base = PFN_DOWN(phys_addr);
+	dma_mem->size = pages;
+	dma_mem->flags = flags;
+	spin_lock_init(&dma_mem->spinlock);
+
+	*mem = dma_mem;
+	return 0;
+
+err_free_dma_mem:
+	kfree(dma_mem);
+
+err_memunmap:
+	memunmap(mem_base);
+	return ret;
+}
+
+int nvmap_dma_declare_coherent_memory(struct device *dev, phys_addr_t phys_addr,
+                        dma_addr_t device_addr, size_t size, int flags)
+{
+	struct dma_coherent_mem_replica *mem;
+	int ret;
+
+	ret = nvmap_dma_init_coherent_memory(phys_addr, device_addr, size, flags, &mem);
+	if (ret)
+		return ret;
+
+	ret = nvmap_dma_assign_coherent_memory(dev, mem);
+	if (ret)
+		nvmap_dma_release_coherent_memory(mem);
+	return ret;
+}
+#endif
+
 static int __init nvmap_co_device_init(struct reserved_mem *rmem,
 					struct device *dev)
 {
@@ -305,9 +400,15 @@ static int __init nvmap_co_device_init(struct reserved_mem *rmem,
 		return 0;
 
 	if (!co->cma_dev) {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
 		err = dma_declare_coherent_memory(co->dma_dev, 0,
 				co->base, co->size,
 				DMA_MEMORY_NOMAP | DMA_MEMORY_EXCLUSIVE);
+#else
+		err = nvmap_dma_declare_coherent_memory(co->dma_dev, 0,
+				co->base, co->size,
+				DMA_MEMORY_NOMAP | DMA_MEMORY_EXCLUSIVE);
+#endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
 		if (!err) {
 #else
@@ -323,6 +424,8 @@ static int __init nvmap_co_device_init(struct reserved_mem *rmem,
 				"%s :dma coherent mem declare fail %pa,%zu,err:%d\n",
 				co->name, &co->base, co->size, err);
 	} else {
+#ifdef CONFIG_TEGRA_VPR
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 		/*
 		 * When vpr memory is reserved, kmemleak tries to scan vpr
 		 * memory for pointers. vpr memory should not be accessed
@@ -332,6 +435,7 @@ static int __init nvmap_co_device_init(struct reserved_mem *rmem,
 		 */
 		if (!strncmp(co->name, "vpr", 3))
 			kmemleak_no_scan(__va(co->base));
+#endif
 
 		co->dma_info->cma_dev = co->cma_dev;
 		err = dma_declare_coherent_resizable_cma_memory(
@@ -340,6 +444,7 @@ static int __init nvmap_co_device_init(struct reserved_mem *rmem,
 			dev_err(dev, "%s coherent memory declaration failed\n",
 				     co->name);
 		else
+#endif
 			co->init_done = true;
 	}
 	return err;
@@ -361,6 +466,7 @@ static const struct reserved_mem_ops nvmap_co_ops = {
 	.device_release	= nvmap_co_device_release,
 };
 
+#ifndef NVMAP_LOADABLE_MODULE
 int __init nvmap_co_setup(struct reserved_mem *rmem)
 {
 	struct nvmap_platform_carveout *co;
@@ -403,7 +509,12 @@ int __init nvmap_co_setup(struct reserved_mem *rmem)
 	}
 
 	dma_contiguous_early_fixup(rmem->base, rmem->size);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+	if (co->cma_dev)
+		co->cma_dev->cma_area = cma;
+#else
 	dev_set_cma_area(co->cma_dev, cma);
+#endif
 	pr_debug("tegra-carveouts carveout=%s %pa@%pa\n",
 		 rmem->name, &rmem->size, &rmem->base);
 	goto finish;
@@ -415,10 +526,39 @@ finish:
 	return ret;
 }
 EXPORT_SYMBOL(nvmap_co_setup);
+#else
+int __init nvmap_co_setup(struct reserved_mem *rmem)
+{
+	struct nvmap_platform_carveout *co;
+	ulong start = sched_clock();
+	int ret = 0;
+
+	co = nvmap_get_carveout_pdata(rmem->name);
+	if (!co)
+		return ret;
+
+	rmem->ops = &nvmap_co_ops;
+	rmem->priv = co;
+
+	/* IVM carveouts */
+	if (!co->name)
+		goto finish;
+
+	co->base = rmem->base;
+	co->size = rmem->size;
+	co->cma_dev = NULL;
+finish:
+	nvmap_init_time += sched_clock() - start;
+	return ret;
+}
+#endif /* !NVMAP_LOADABLE_MODULE */
+
 RESERVEDMEM_OF_DECLARE(nvmap_co, "nvidia,generic_carveout", nvmap_co_setup);
 RESERVEDMEM_OF_DECLARE(nvmap_ivm_co, "nvidia,ivm_carveout", nvmap_co_setup);
-RESERVEDMEM_OF_DECLARE(nvmap_iram_co, "nvidia,iram-carveout", nvmap_co_setup);
+#ifndef NVMAP_LOADABLE_MODULE
 RESERVEDMEM_OF_DECLARE(nvmap_vpr_co, "nvidia,vpr-carveout", nvmap_co_setup);
+RESERVEDMEM_OF_DECLARE(nvmap_fsi_co, "nvidia,fsi-carveout", nvmap_co_setup);
+#endif /* !NVMAP_LOADABLE_MODULE */
 
 /*
  * This requires proper kernel arguments to have been passed.
@@ -426,19 +566,19 @@ RESERVEDMEM_OF_DECLARE(nvmap_vpr_co, "nvidia,vpr-carveout", nvmap_co_setup);
 static int __nvmap_init_legacy(struct device *dev)
 {
 	/* Carveout. */
-	if (!nvmap_carveouts[1].base) {
-		nvmap_carveouts[1].base = tegra_carveout_start;
-		nvmap_carveouts[1].size = tegra_carveout_size;
+	if (!nvmap_carveouts[0].base) {
+		nvmap_carveouts[0].base = tegra_carveout_start;
+		nvmap_carveouts[0].size = tegra_carveout_size;
 		if (!tegra_vpr_resize)
-			nvmap_carveouts[1].cma_dev = NULL;
+			nvmap_carveouts[0].cma_dev = NULL;
 	}
 
 	/* VPR */
-	if (!nvmap_carveouts[2].base) {
-		nvmap_carveouts[2].base = tegra_vpr_start;
-		nvmap_carveouts[2].size = tegra_vpr_size;
+	if (!nvmap_carveouts[1].base) {
+		nvmap_carveouts[1].base = tegra_vpr_start;
+		nvmap_carveouts[1].size = tegra_vpr_size;
 		if (!tegra_vpr_resize)
-			nvmap_carveouts[2].cma_dev = NULL;
+			nvmap_carveouts[1].cma_dev = NULL;
 	}
 
 	return 0;
@@ -464,15 +604,15 @@ int __init nvmap_init(struct platform_device *pdev)
 		pr_debug("reserved_mem_device_init fails, try legacy init\n");
 
 	/* try legacy init */
-	if (!nvmap_carveouts[1].init_done) {
-		rmem.priv = &nvmap_carveouts[1];
+	if (!nvmap_carveouts[0].init_done) {
+		rmem.priv = &nvmap_carveouts[0];
 		err = nvmap_co_device_init(&rmem, &pdev->dev);
 		if (err)
 			goto end;
 	}
 
-	if (!nvmap_carveouts[2].init_done) {
-		rmem.priv = &nvmap_carveouts[2];
+	if (!nvmap_carveouts[1].init_done) {
+		rmem.priv = &nvmap_carveouts[1];
 		err = nvmap_co_device_init(&rmem, &pdev->dev);
 	}
 
@@ -487,7 +627,9 @@ static struct platform_driver __refdata nvmap_driver = {
 	.driver = {
 		.name	= "tegra-carveouts",
 		.owner	= THIS_MODULE,
+#ifndef NVMAP_LOADABLE_MODULE
 		.of_match_table = nvmap_of_ids,
+#endif /* !NVMAP_LOADABLE_MODULE */
 		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
 		.suppress_bind_attrs = true,
 	},
@@ -496,21 +638,50 @@ static struct platform_driver __refdata nvmap_driver = {
 static int __init nvmap_init_driver(void)
 {
 	int e = 0;
+#ifdef NVMAP_LOADABLE_MODULE
+	struct platform_device *pdev;
+#endif /* NVMAP_LOADABLE_MODULE */
 
 	e = nvmap_heap_init();
 	if (e)
 		goto fail;
 
+#ifdef NVMAP_LOADABLE_MODULE
+	if (!(of_machine_is_compatible("nvidia,tegra186") || of_machine_is_compatible("nvidia,tegra194"))) {
+		nvmap_heap_deinit();
+		return -ENODEV;
+	}
+#endif /* NVMAP_LOADABLE_MODULE */
 	e = platform_driver_register(&nvmap_driver);
 	if (e) {
 		nvmap_heap_deinit();
 		goto fail;
 	}
 
+#ifdef NVMAP_LOADABLE_MODULE
+	e = nvmap_t19x_init();
+	if (e) {
+		platform_driver_unregister(&nvmap_driver);
+		nvmap_heap_deinit();
+		goto fail;
+	}
+	pdev = platform_device_register_simple("tegra-carveouts", -1, NULL, 0);
+	if (IS_ERR(pdev)) {
+		nvmap_heap_deinit();
+		platform_driver_unregister(&nvmap_driver);
+		return PTR_ERR(pdev);
+	}
+#endif /* NVMAP_LOADABLE_MODULE */
+
 fail:
 	return e;
 }
+
+#ifdef NVMAP_LOADABLE_MODULE
+module_init(nvmap_init_driver);
+#else
 fs_initcall(nvmap_init_driver);
+#endif /* NVMAP_LOADABLE_MODULE */
 
 static void __exit nvmap_exit_driver(void)
 {
@@ -519,3 +690,6 @@ static void __exit nvmap_exit_driver(void)
 	nvmap_dev = NULL;
 }
 module_exit(nvmap_exit_driver);
+MODULE_DESCRIPTION("NVMAP");
+MODULE_AUTHOR("Puneet Saxena <puneets@nvidia.com>");
+MODULE_LICENSE("GPL v2");

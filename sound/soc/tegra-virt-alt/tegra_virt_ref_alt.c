@@ -1,7 +1,7 @@
 /*
  * tegra_virt_ref_alt.c - Tegra reference virtual machine driver
  *
- * Copyright (c) 2015-2019, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2015-2021, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -24,7 +24,6 @@
 #include <sound/soc.h>
 #include <linux/of_platform.h>
 #include <linux/pm_runtime.h>
-#include <linux/tegra_pm_domains.h>
 
 #include "tegra_asoc_metadata_util_alt.h"
 #include "tegra210_virt_alt_admaif.h"
@@ -65,18 +64,12 @@ static void tegra_virt_set_dai_params(
 	dai_link[dai_id].params = user_params;
 }
 
-static struct tegra_virt_admaif_soc_data soc_data_tegra210 = {
-	.num_ch = TEGRA210_ADMAIF_CHANNEL_COUNT,
-};
-
 static struct tegra_virt_admaif_soc_data soc_data_tegra186 = {
 	.num_ch = TEGRA186_ADMAIF_CHANNEL_COUNT,
 };
 
 
 static const struct of_device_id tegra_virt_machine_of_match[] = {
-	{ .compatible = "nvidia,tegra210-virt-pcm",
-		.data = &soc_data_tegra210 },
 	{ .compatible = "nvidia,tegra186-virt-pcm",
 		.data = &soc_data_tegra186},
 	{},
@@ -95,9 +88,8 @@ static int tegra_virt_machine_driver_probe(struct platform_device *pdev)
 	int32_t adsp_admaif_bits, adsp_admaif_format;
 	int32_t adsp_admaif_channels;
 	struct snd_soc_pcm_stream adsp_admaif_dt_params;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 5, 0)
 	struct snd_soc_pcm_runtime *rtd;
-#endif
+
 	match = tegra_virt_machine_of_match;
 	if (of_device_is_compatible(pdev->dev.of_node,
 		"nvidia,tegra210-virt-pcm")) {
@@ -230,32 +222,11 @@ static int tegra_virt_machine_driver_probe(struct platform_device *pdev)
 		ret = -EPROBE_DEFER;
 		goto undo_register_codec;
 	}
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 5, 0)
-	for (i = 0; i < card->num_rtd; i++) {
-		struct snd_soc_dai *codec_dai = card->rtd[i].codec_dai;
-		struct snd_soc_dai_driver *codec_drv = codec_dai->driver;
-		struct snd_soc_dai *cpu_dai = card->rtd[i].cpu_dai;
-		struct snd_soc_dai_driver *cpu_drv = cpu_dai->driver;
 
-		cpu_drv->playback.rates = SNDRV_PCM_RATE_KNOT;
-		cpu_drv->playback.rate_min = 8000;
-		cpu_drv->playback.rate_max = 192000;
-		cpu_drv->capture.rates = SNDRV_PCM_RATE_KNOT;
-		cpu_drv->capture.rate_min = 8000;
-		cpu_drv->capture.rate_max = 192000;
-
-		codec_drv->playback.rates = SNDRV_PCM_RATE_KNOT;
-		codec_drv->playback.rate_min = 8000;
-		codec_drv->playback.rate_max = 192000;
-		codec_drv->capture.rates = SNDRV_PCM_RATE_KNOT;
-		codec_drv->capture.rate_min = 8000;
-		codec_drv->capture.rate_max = 192000;
-	}
-#else
 	list_for_each_entry(rtd, &card->rtd_list, list) {
-		struct snd_soc_dai *codec_dai = rtd->codec_dai;
+		struct snd_soc_dai *codec_dai = asoc_rtd_to_codec(rtd, 0);
 		struct snd_soc_dai_driver *codec_drv = codec_dai->driver;
-		struct snd_soc_dai *cpu_dai = rtd->cpu_dai;
+		struct snd_soc_dai *cpu_dai = asoc_rtd_to_cpu(rtd, 0);
 		struct snd_soc_dai_driver *cpu_drv = cpu_dai->driver;
 
 		cpu_drv->playback.rates = SNDRV_PCM_RATE_KNOT;
@@ -272,15 +243,14 @@ static int tegra_virt_machine_driver_probe(struct platform_device *pdev)
 		codec_drv->capture.rate_min = 8000;
 		codec_drv->capture.rate_max = 192000;
 	}
-#endif
+
 	tegra_metadata_setup(pdev, &meta, card);
-	tegra_pd_add_device(&pdev->dev);
 	pm_runtime_forbid(&pdev->dev);
 
 	return 0;
 
 undo_register_codec:
-	snd_soc_unregister_codec(&pdev->dev);
+	snd_soc_unregister_component(&pdev->dev);
 undo_register_component:
 	tegra210_virt_admaif_unregister_component(pdev);
 

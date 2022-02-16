@@ -29,7 +29,7 @@
  * DAMAGE.
  * ========================================================================= */
 /*
- * Copyright (c) 2015-2021, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2015-2020, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -43,7 +43,12 @@
 /*!@file: eqos_dev.c
  * @brief: Driver functions.
  */
+#include <linux/version.h>
+#if KERNEL_VERSION(4, 15, 0) > LINUX_VERSION_CODE
 #include <soc/tegra/chip-id.h>
+#else
+#include <soc/tegra/fuse.h>
+#endif
 #include <linux/clk.h>
 #include <linux/reset.h>
 #include <linux/tegra_prod.h>
@@ -2179,8 +2184,6 @@ static INT set_gmii_speed(struct eqos_prv_data *pdata)
 
 	MAC_MCR_PS_WR(0);
 	MAC_MCR_FES_WR(0);
-	if (tegra_platform_is_unit_fpga())
-		CLK_CRTL0_TX_CLK_WR(0);
 
 	return Y_SUCCESS;
 }
@@ -2198,8 +2201,6 @@ static INT set_mii_speed_10(struct eqos_prv_data *pdata)
 
 	MAC_MCR_PS_WR(0x1);
 	MAC_MCR_FES_WR(0);
-	if (tegra_platform_is_unit_fpga())
-		CLK_CRTL0_TX_CLK_WR(1);
 
 	return Y_SUCCESS;
 }
@@ -2217,8 +2218,6 @@ static INT set_mii_speed_100(struct eqos_prv_data *pdata)
 
 	MAC_MCR_PS_WR(0x1);
 	MAC_MCR_FES_WR(0x1);
-	if (tegra_platform_is_unit_fpga())
-		CLK_CRTL0_TX_CLK_WR(0);
 
 	return Y_SUCCESS;
 }
@@ -2997,34 +2996,6 @@ static void pre_transmit(struct eqos_prv_data *pdata, UINT qinx)
 	/* set Interrupt on Completion for last descriptor */
 	TX_NORMAL_DESC_TDES2_IC_WR(plast_desc->tdes2, 0x1);
 
-	if (ptx_ring->frame_cnt < UINT_MAX) {
-		ptx_ring->frame_cnt++;
-	} else if (ptx_ring->use_tx_frames == EQOS_COAELSCING_ENABLE &&
-		   (ptx_ring->frame_cnt %
-					ptx_ring->tx_coal_frames) < UINT_MAX) {
-		/* make sure count for tx_frame interrupt logic is retained */
-		ptx_ring->frame_cnt =
-				(ptx_ring->frame_cnt % ptx_ring->tx_coal_frames)
-					+ 1U;
-	} else {
-		ptx_ring->frame_cnt = 1U;
-	}
-
-	if (ptx_ring->use_tx_usecs == EQOS_COAELSCING_ENABLE) {
-		TX_NORMAL_DESC_TDES2_IC_WR(plast_desc->tdes2, 0x0);
-
-		/* update IOC bit if tx_frames is enabled. Tx_frames
-		 * can be enabled only along with tx_usecs.
-		 */
-		if (ptx_ring->use_tx_frames == EQOS_COAELSCING_ENABLE) {
-			if ((ptx_ring->frame_cnt %
-					ptx_ring->tx_coal_frames) == 0) {
-				TX_NORMAL_DESC_TDES2_IC_WR(
-							plast_desc->tdes2, 0x1);
-			}
-		}
-	}
-
 	/* set OWN bit of FIRST descriptor at end to avoid race condition */
 	ptx_desc = GET_TX_DESC_PTR(qinx, start_index);
 	TX_NORMAL_DESC_TDES3_OWN_WR(ptx_desc->tdes3, 0x1);
@@ -3122,7 +3093,7 @@ static void eqos_read_err_counter(struct eqos_prv_data *pdata, bool save)
 		MMC_TXEXCESSDEF_RD(val);
 		pdata->mmc.mmc_tx_excessdef_pre_recalib += val;
 		MMC_RXCRCERROR_RD(val);
-		pdata->mmc.mmc_rx_crc_error_pre_recalib += val;
+		pdata->mmc.mmc_rx_crc_errror_pre_recalib += val;
 		MMC_RXALIGNMENTERROR_RD(val);
 		pdata->mmc.mmc_rx_align_error_pre_recalib += val;
 		MMC_RXRUNTERROR_RD(val);
@@ -3190,10 +3161,7 @@ static INT eqos_pad_calibrate(struct eqos_prv_data *pdata)
 	struct platform_device *pdev = pdata->pdev;
 	int ret;
 	int i;
-	u32 hwreg = 0;
-
-	if (tegra_platform_is_unit_fpga())
-		return 0;
+	u32 hwreg;
 
 	pr_debug("-->%s()\n", __func__);
 
@@ -3205,17 +3173,12 @@ static INT eqos_pad_calibrate(struct eqos_prv_data *pdata)
 	/* 2. delay for 1 usec */
 	usleep_range(1, 3);
 
-	/* use platform specific ETHER_QOS_AUTO_CAL_CONFIG_0 register value if set */
-	if(pdata->dt_cfg.reg_auto_cal_config_0_val)
-		hwreg = pdata->dt_cfg.reg_auto_cal_config_0_val;
-	else
-		PAD_AUTO_CAL_CFG_RD(hwreg);
-
 	/* 3. Set AUTO_CAL_ENABLE and AUTO_CAL_START in
 	 * reg ETHER_QOS_AUTO_CAL_CONFIG_0.
 	 */
+	PAD_AUTO_CAL_CFG_RD(hwreg);
 	hwreg |=
-		(PAD_AUTO_CAL_CFG_START_MASK) | (PAD_AUTO_CAL_CFG_ENABLE_MASK);
+	    ((PAD_AUTO_CAL_CFG_START_MASK) | (PAD_AUTO_CAL_CFG_ENABLE_MASK));
 
 	PAD_AUTO_CAL_CFG_WR(hwreg);
 
@@ -3265,7 +3228,7 @@ static INT eqos_car_reset(struct eqos_prv_data *pdata)
 
 	/* deassert rst line */
 	if (!IS_ERR_OR_NULL(pdata->eqos_rst))
-		reset_control_reset(pdata->eqos_rst);
+		reset_control_deassert(pdata->eqos_rst);
 
 	/* add delay of 10 usec */
 	udelay(10);
@@ -3757,7 +3720,7 @@ static INT configure_mac(struct eqos_prv_data *pdata)
 
 	if (pdata->dev->mtu > EQOS_ETH_FRAME_LEN) {
 		/* Configure for Jumbo frame in MAC */
-		if (pdata->dev->mtu <= EQOS_MAX_GPSL) {
+		if (pdata->dev->mtu <= EQOS_MAX_HW_MTU) {
 			MAC_MCR_JE_WR(0x1);
 			MAC_MCR_WD_WR(0x0);
 			MAC_MCR_GPSLCE_WR(0x0);
@@ -3766,7 +3729,7 @@ static INT configure_mac(struct eqos_prv_data *pdata)
 			MAC_MCR_JE_WR(0x0);
 			MAC_MCR_WD_WR(0x1);
 			MAC_MCR_GPSLCE_WR(0x1);
-			MAC_MECR_GPSL_WR(EQOS_MAX_SUPPORTED_MTU);
+			MAC_MECR_GPSL_WR(EQOS_DEFAULT_PLATFORM_MTU);
 			MAC_MCR_JD_WR(0x1);
 		}
 	} else {

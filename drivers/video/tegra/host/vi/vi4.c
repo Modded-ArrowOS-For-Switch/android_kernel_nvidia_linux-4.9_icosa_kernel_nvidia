@@ -22,10 +22,15 @@
 #include <linux/platform_device.h>
 #include <linux/reset.h>
 #include <linux/slab.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
 #include <linux/tegra_pm_domains.h>
+#else
+#include <linux/pm_domain.h>
+#endif
 #include <linux/uaccess.h>
 #include <linux/module.h>
-#include <media/capture_vi_channel.h>
+#include <media/fusa-capture/capture-vi-channel.h>
 #include <soc/tegra/camrtc-capture.h>
 
 #include "dev.h"
@@ -57,6 +62,8 @@
 /* HW capability, pixels per clock */
 #define NUM_PPC					8
 #define VI_OVERHEAD				10
+
+#define DEFAULT_VI_CHANNELS	64
 
 /* Interrupt handler */
 /* NOTE: VI4 has three interrupt lines. This handler is for the master/error
@@ -271,7 +278,6 @@ static int tegra_vi4_probe(struct platform_device *pdev)
 	struct tegra_vi_data *data = NULL;
 	int err;
 	struct tegra_camera_dev_info vi_info;
-	unsigned int num_channels = 0;
 
 	dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(39));
 	memset(&vi_info, 0, sizeof(vi_info));
@@ -289,21 +295,6 @@ static int tegra_vi4_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "No device data!\n");
 		return -EINVAL;
 	}
-
-	if (of_property_read_u32(pdev->dev.of_node, "nvidia,num-vi-channels",
-				&num_channels)) {
-		dev_warn(&pdev->dev,
-			"using default number of vi channels,%d\n",
-			pdata->num_channels);
-	} else {
-		if (num_channels < pdata->num_channels) {
-			pdata->num_channels = num_channels;
-		} else {
-			dev_warn(&pdev->dev,
-				"num vi-channels are out of range, use default num\n");
-		}
-	}
-	dev_dbg(&pdev->dev, "num vi channels : %d\n", pdata->num_channels);
 
 	pdata->pdev = pdev;
 	mutex_init(&pdata->lock);
@@ -373,7 +364,11 @@ static int tegra_vi4_probe(struct platform_device *pdev)
 		return err;
 	}
 
-	err = vi_channel_drv_register(pdev, &vi4_channel_drv_ops);
+	err = vi_channel_drv_register(pdev, DEFAULT_VI_CHANNELS);
+	if (err)
+		return err;
+
+	err = vi_channel_drv_fops_register(&vi4_channel_drv_ops);
 	if (err)
 		return err;
 
@@ -400,7 +395,11 @@ static int tegra_vi4_remove(struct platform_device *pdev)
 	nvhost_client_device_release(pdev);
 	/* ^ includes call to nvhost_module_deinit() */
 #ifdef CONFIG_PM_GENERIC_DOMAINS
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
 	tegra_pd_remove_device(&pdev->dev);
+#else
+	pm_genpd_remove_device(&pdev->dev);
+#endif
 #endif
 	debugfs_remove_recursive(vi->debug_dir);
 	return 0;

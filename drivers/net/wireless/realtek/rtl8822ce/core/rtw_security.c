@@ -3341,6 +3341,7 @@ u8 rtw_handle_tkip_countermeasure(_adapter *adapter, const char *caller)
 	return status;
 }
 
+#ifdef CONFIG_WOWLAN
 u16 rtw_cal_crc16(u8 data, u16 crc)
 {
 	u8 shift_in, data_bit;
@@ -3404,3 +3405,4 @@ u16 rtw_calc_crc(u8  *pdata, int length)
 
 	return crc;
 }
+#endif /*CONFIG_WOWLAN*/

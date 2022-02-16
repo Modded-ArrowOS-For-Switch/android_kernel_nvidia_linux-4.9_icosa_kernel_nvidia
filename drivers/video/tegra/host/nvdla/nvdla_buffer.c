@@ -273,6 +273,7 @@ int nvdla_buffer_submit_pin(struct nvdla_buffers *nvdla_buffers,
 		if (heap != NULL)
 			heap[i] = vm->heap;
 	}
+	speculation_barrier(); /* break_spec_p#5_1 */
 
 	mutex_unlock(&nvdla_buffers->mutex);
 	return 0;
@@ -316,6 +317,7 @@ int nvdla_buffer_pin(struct nvdla_buffers *nvdla_buffers,
 
 		nvdla_buffer_insert_map_buffer(nvdla_buffers, vm);
 	}
+	speculation_barrier(); /* break_spec_p#5_1 */
 
 	mutex_unlock(&nvdla_buffers->mutex);
 	return err;
@@ -374,6 +376,7 @@ void nvdla_buffer_unpin(struct nvdla_buffers *nvdla_buffers,
 			vm->user_map_count = 0;
 		nvdla_buffer_unmap(nvdla_buffers, vm);
 	}
+	speculation_barrier(); /* break_spec_p#5_1 */
 
 	mutex_unlock(&nvdla_buffers->mutex);
 }

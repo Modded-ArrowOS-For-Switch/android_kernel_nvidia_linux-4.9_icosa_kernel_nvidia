@@ -1,7 +1,7 @@
 /*
  * dma_buf exporter for nvmap
  *
- * Copyright (c) 2012-2018, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2012-2021, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -36,6 +36,16 @@
 
 #include "nvmap_priv.h"
 #include "nvmap_ioctl.h"
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
+#define NVMAP_DMABUF_ATTACH  nvmap_dmabuf_attach
+#else
+#define NVMAP_DMABUF_ATTACH  __nvmap_dmabuf_attach
+#endif
+
+#ifdef NVMAP_LOADABLE_MODULE
+#define CONFIG_NVMAP_FD_START 0x400
+#endif /* NVMAP_LOADABLE_MODULE */
 
 /**
  * List node for maps of nvmap handles via the dma_buf API. These store the
@@ -89,7 +99,7 @@ int nvmap_dmabuf_stash_init(void)
 	return 0;
 }
 
-static int nvmap_dmabuf_attach(struct dma_buf *dmabuf, struct device *dev,
+static int __nvmap_dmabuf_attach(struct dma_buf *dmabuf, struct device *dev,
 			       struct dma_buf_attachment *attach)
 {
 	struct nvmap_handle_info *info = dmabuf->priv;
@@ -99,6 +109,14 @@ static int nvmap_dmabuf_attach(struct dma_buf *dmabuf, struct device *dev,
 	dev_dbg(dev, "%s() 0x%p\n", __func__, info->handle);
 	return 0;
 }
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
+static int nvmap_dmabuf_attach(struct dma_buf *dmabuf,
+			       struct dma_buf_attachment *attach)
+{
+	return __nvmap_dmabuf_attach(dmabuf, attach->dev, attach);
+}
+#endif
 
 static void nvmap_dmabuf_detach(struct dma_buf *dmabuf,
 				struct dma_buf_attachment *attach)
@@ -129,7 +147,7 @@ static void __nvmap_dmabuf_del_stash(struct nvmap_handle_sgt *nvmap_sgt)
 
 static inline bool access_vpr_phys(struct device *dev)
 {
-	if (!device_is_iommuable(dev))
+	if (!iommu_get_domain_for_dev(dev))
 		return true;
 
 	/*
@@ -149,7 +167,6 @@ static inline bool access_vpr_phys(struct device *dev)
 static void __nvmap_dmabuf_free_sgt_locked(struct nvmap_handle_sgt *nvmap_sgt)
 {
 	struct nvmap_handle_info *info = nvmap_sgt->owner;
-	DEFINE_DMA_ATTRS(attrs);
 
 	list_del(&nvmap_sgt->maps_entry);
 
@@ -159,11 +176,9 @@ static void __nvmap_dmabuf_free_sgt_locked(struct nvmap_handle_sgt *nvmap_sgt)
 			access_vpr_phys(nvmap_sgt->dev)) {
 		sg_dma_address(nvmap_sgt->sgt->sgl) = 0;
 	} else {
-		dma_set_attr(DMA_ATTR_SKIP_IOVA_GAP, __DMA_ATTR(attrs));
-		dma_set_attr(DMA_ATTR_SKIP_CPU_SYNC, __DMA_ATTR(attrs));
 		dma_unmap_sg_attrs(nvmap_sgt->dev,
 				   nvmap_sgt->sgt->sgl, nvmap_sgt->sgt->nents,
-				   nvmap_sgt->dir, __DMA_ATTR(attrs));
+				   nvmap_sgt->dir, DMA_ATTR_SKIP_IOVA_GAP | DMA_ATTR_SKIP_CPU_SYNC);
 	}
 	__nvmap_free_sg_table(NULL, info->handle, nvmap_sgt->sgt);
 
@@ -403,6 +418,30 @@ static void nvmap_dmabuf_release(struct dma_buf *dmabuf)
 	kfree(info);
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
+static int __nvmap_dmabuf_end_cpu_access(struct dma_buf *dmabuf,
+				       enum dma_data_direction dir)
+{
+	struct nvmap_handle_info *info = dmabuf->priv;
+
+	trace_nvmap_dmabuf_end_cpu_access(dmabuf, 0, dmabuf->size);
+	return __nvmap_do_cache_maint(NULL, info->handle,
+				   0, dmabuf->size,
+				   NVMAP_CACHE_OP_WB, false);
+}
+
+static int __nvmap_dmabuf_begin_cpu_access(struct dma_buf *dmabuf,
+					  enum dma_data_direction dir)
+{
+	struct nvmap_handle_info *info = dmabuf->priv;
+
+	trace_nvmap_dmabuf_begin_cpu_access(dmabuf, 0, dmabuf->size);
+	return __nvmap_do_cache_maint(NULL, info->handle, 0, dmabuf->size,
+				      NVMAP_CACHE_OP_WB_INV, false);
+}
+#define NVMAP_DMABUF_BEGIN_CPU_ACCESS           __nvmap_dmabuf_begin_cpu_access
+#define NVMAP_DMABUF_END_CPU_ACCESS 		__nvmap_dmabuf_end_cpu_access
+#else
 static int nvmap_dmabuf_begin_cpu_access(struct dma_buf *dmabuf,
 					  size_t start, size_t len,
 					  enum dma_data_direction dir)
@@ -425,7 +464,11 @@ static void nvmap_dmabuf_end_cpu_access(struct dma_buf *dmabuf,
 				   start, start + len,
 				   NVMAP_CACHE_OP_WB, false);
 }
+#define NVMAP_DMABUF_BEGIN_CPU_ACCESS           nvmap_dmabuf_begin_cpu_access
+#define NVMAP_DMABUF_END_CPU_ACCESS 		nvmap_dmabuf_end_cpu_access
+#endif
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
 static void *nvmap_dmabuf_kmap(struct dma_buf *dmabuf, unsigned long page_num)
 {
 	struct nvmap_handle_info *info = dmabuf->priv;
@@ -449,6 +492,7 @@ static void *nvmap_dmabuf_kmap_atomic(struct dma_buf *dmabuf,
 	WARN(1, "%s() can't be called from atomic\n", __func__);
 	return NULL;
 }
+#endif
 
 int __nvmap_map(struct nvmap_handle *h, struct vm_area_struct *vma)
 {
@@ -508,6 +552,7 @@ static int nvmap_dmabuf_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
 	return __nvmap_map(info->handle, vma);
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0)
 static void *nvmap_dmabuf_vmap(struct dma_buf *dmabuf)
 {
 	struct nvmap_handle_info *info = dmabuf->priv;
@@ -523,8 +568,35 @@ static void nvmap_dmabuf_vunmap(struct dma_buf *dmabuf, void *vaddr)
 	trace_nvmap_dmabuf_vunmap(dmabuf);
 	__nvmap_munmap(info->handle, vaddr);
 }
+#else
+static int nvmap_dmabuf_vmap(struct dma_buf *dmabuf, struct dma_buf_map *map)
+{
+	struct nvmap_handle_info *info = dmabuf->priv;
+	void *res;
+	int ret = 0;
 
-static int nvmap_dmabuf_set_private(struct dma_buf *dmabuf,
+	trace_nvmap_dmabuf_vmap(dmabuf);
+	res = __nvmap_mmap(info->handle);
+	if (res != NULL) {
+		map->vaddr = res;
+		map->is_iomem = false;
+	}
+	else {
+		ret = -ENOMEM;
+	}
+	return ret;
+}
+
+static void nvmap_dmabuf_vunmap(struct dma_buf *dmabuf, struct dma_buf_map *map)
+{
+       struct nvmap_handle_info *info = dmabuf->priv;
+
+       trace_nvmap_dmabuf_vunmap(dmabuf);
+       __nvmap_munmap(info->handle, info->handle->vaddr);
+}
+#endif
+
+int nvmap_dmabuf_set_drv_data(struct dma_buf *dmabuf,
 		struct device *dev, void *priv, void (*delete)(void *priv))
 {
 	struct nvmap_handle_info *info = dmabuf->priv;
@@ -554,13 +626,23 @@ unlock:
 	return ret;
 }
 
-static void *nvmap_dmabuf_get_private(struct dma_buf *dmabuf,
+void *nvmap_dmabuf_get_drv_data(struct dma_buf *dmabuf,
 		struct device *dev)
 {
-	void *priv = NULL;
-	struct nvmap_handle_info *info = dmabuf->priv;
-	struct nvmap_handle *handle = info->handle;
 	struct nvmap_handle_dmabuf_priv *curr = NULL;
+	struct nvmap_handle_info *info;
+	struct nvmap_handle *handle;
+	void *priv = NULL;
+
+	if (dmabuf && dmabuf->priv)
+		info = dmabuf->priv;
+	else
+		return NULL;
+
+	if (info && info->handle)
+		handle = info->handle;
+	else
+		return NULL;
 
 	mutex_lock(&handle->lock);
 	list_for_each_entry(curr, &handle->dmabuf_priv, list) {
@@ -575,37 +657,39 @@ unlock:
 }
 
 static struct dma_buf_ops nvmap_dma_buf_ops = {
-	.attach		= nvmap_dmabuf_attach,
+	.attach		= NVMAP_DMABUF_ATTACH,
 	.detach		= nvmap_dmabuf_detach,
 	.map_dma_buf	= nvmap_dmabuf_map_dma_buf,
 	.unmap_dma_buf	= nvmap_dmabuf_unmap_dma_buf,
 	.release	= nvmap_dmabuf_release,
-	.begin_cpu_access = nvmap_dmabuf_begin_cpu_access,
-	.end_cpu_access = nvmap_dmabuf_end_cpu_access,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
-	.map_atomic	= nvmap_dmabuf_kmap_atomic,
-	.map		= nvmap_dmabuf_kmap,
-	.unmap		= nvmap_dmabuf_kunmap,
-#else
+	.begin_cpu_access = NVMAP_DMABUF_BEGIN_CPU_ACCESS,
+	.end_cpu_access = NVMAP_DMABUF_END_CPU_ACCESS,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
 	.kmap_atomic	= nvmap_dmabuf_kmap_atomic,
 	.kmap		= nvmap_dmabuf_kmap,
 	.kunmap		= nvmap_dmabuf_kunmap,
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
+	.map_atomic	= nvmap_dmabuf_kmap_atomic,
+	.map		= nvmap_dmabuf_kmap,
+	.unmap		= nvmap_dmabuf_kunmap,
 #endif
 	.mmap		= nvmap_dmabuf_mmap,
 	.vmap		= nvmap_dmabuf_vmap,
 	.vunmap		= nvmap_dmabuf_vunmap,
-	.set_drvdata	= nvmap_dmabuf_set_private,
-	.get_drvdata	= nvmap_dmabuf_get_private,
+#if LINUX_VERSION_CODE > KERNEL_VERSION(5, 4, 0)
+	.cache_sgt_mapping = true,
+#endif
+
 };
+
+static char dmabuf_name[] = "nvmap_dmabuf";
 
 bool dmabuf_is_nvmap(struct dma_buf *dmabuf)
 {
-	return dmabuf->ops == &nvmap_dma_buf_ops;
+	return dmabuf->exp_name == dmabuf_name;
 }
 EXPORT_SYMBOL(dmabuf_is_nvmap);
 
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
 static struct dma_buf *__dma_buf_export(struct nvmap_handle_info *info,
 					size_t size, bool ro_buf)
 {
@@ -621,15 +705,14 @@ static struct dma_buf *__dma_buf_export(struct nvmap_handle_info *info,
 		exp_info.flags = O_RDWR;
 	}
 
+#ifndef NVMAP_LOADABLE_MODULE
 	exp_info.exp_flags = DMABUF_CAN_DEFER_UNMAP |
 				DMABUF_SKIP_CACHE_SYNC;
+#endif /* !NVMAP_LOADABLE_MODULE */
+	exp_info.exp_name = dmabuf_name;
 
 	return dma_buf_export(&exp_info);
 }
-#else
-#define __dma_buf_export(info, size) \
-	dma_buf_export(info, &nvmap_dma_buf_ops, size, O_RDWR, NULL)
-#endif
 
 /*
  * Make a dmabuf object for an nvmap handle.
@@ -669,7 +752,9 @@ err_nomem:
 int __nvmap_dmabuf_fd(struct nvmap_client *client,
 		      struct dma_buf *dmabuf, int flags)
 {
+#ifndef NVMAP_LOADABLE_MODULE
 	int start_fd = CONFIG_NVMAP_FD_START;
+#endif /* !NVMAP_LOADABLE_MODULE */
 
 #ifdef CONFIG_NVMAP_DEFER_FD_RECYCLE
 	if (client->next_fd < CONFIG_NVMAP_FD_START)
@@ -684,7 +769,11 @@ int __nvmap_dmabuf_fd(struct nvmap_client *client,
 	 * __FD_SETSIZE limitation issue for select(),
 	 * pselect() syscalls.
 	 */
-	return tegra_alloc_fd(current->files, start_fd, flags);
+#ifndef NVMAP_LOADABLE_MODULE
+	return __alloc_fd(current->files, start_fd, sysctl_nr_open, flags);
+#else
+	return get_unused_fd_flags(flags);
+#endif /* !NVMAP_LOADABLE_MODULE */
 }
 
 int nvmap_get_dmabuf_fd(struct nvmap_client *client, struct nvmap_handle *h)

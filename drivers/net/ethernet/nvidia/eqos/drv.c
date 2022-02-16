@@ -29,7 +29,7 @@
  * DAMAGE.
  * ========================================================================= */
 /*
- * Copyright (c) 2015-2021, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2015-2020, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -55,7 +55,12 @@
 extern ULONG eqos_base_addr;
 #include "yregacc.h"
 #include "nvregacc.h"
+#include <linux/version.h>
+#if KERNEL_VERSION(4, 15, 0) > LINUX_VERSION_CODE
 #include <soc/tegra/chip-id.h>
+#else
+#include <soc/tegra/fuse.h>
+#endif
 #include <linux/nospec.h>
 
 static INT eqos_status;
@@ -244,8 +249,7 @@ void handle_non_ti_ri_chan_intrs(struct eqos_prv_data *pdata, int qinx)
 	/* process only those interrupts which we
 	 * have enabled.
 	 */
-	if (!(tegra_platform_is_unit_fpga()))
-		dma_sr = (dma_sr & dma_ier);
+	dma_sr = (dma_sr & dma_ier);
 
 	/* mask off ri and ti */
 	dma_sr &= ~(((0x1) << 6) | 1);
@@ -258,9 +262,6 @@ void handle_non_ti_ri_chan_intrs(struct eqos_prv_data *pdata, int qinx)
 
 	if ((GET_VALUE(dma_sr, DMA_SR_RBU_LPOS, DMA_SR_RBU_HPOS) & 1))
 		pdata->xstats.rx_buf_unavailable_irq_n[qinx]++;
-
-	if (tegra_platform_is_unit_fpga())
-		dma_sr = (dma_sr & dma_ier);
 
 	if (GET_VALUE(dma_sr, DMA_SR_TPS_LPOS, DMA_SR_TPS_HPOS) & 1) {
 		pdata->xstats.tx_process_stopped_irq_n[qinx]++;
@@ -1177,17 +1178,6 @@ static int eqos_open(struct net_device *dev)
 	}
 	phy_start(pdata->phydev);
 
-	if (pdata->wolopts) {
-		struct ethtool_wolinfo wol = { .cmd = ETHTOOL_SWOL };
-
-		wol.wolopts = WAKE_MAGIC;
-		ret = phy_ethtool_set_wol(pdata->phydev, &wol);
-		if (ret < 0) {
-			dev_err(&dev->dev, "Wol set failed\n");
-			goto err_ptp;
-		}
-	}
-
 	netif_tx_start_all_queues(pdata->dev);
 
 	pr_debug("<--%s()\n", __func__);
@@ -1219,7 +1209,6 @@ static int eqos_open(struct net_device *dev)
 
 static int eqos_close(struct net_device *dev)
 {
-	int i;
 	struct eqos_prv_data *pdata = netdev_priv(dev);
 	struct desc_if_struct *desc_if = &pdata->desc_if;
 
@@ -1229,9 +1218,10 @@ static int eqos_close(struct net_device *dev)
 	if (pdata->phydev) {
 		phy_stop(pdata->phydev);
 		phy_disconnect(pdata->phydev);
-		if (gpio_is_valid(pdata->phy_reset_gpio) &&
-				 (pdata->dt_cfg.phyrst_lpmode == 1U))
+
+		if (gpio_is_valid(pdata->phy_reset_gpio))
 			gpio_set_value(pdata->phy_reset_gpio, 0);
+
 		pdata->phydev = NULL;
 	}
 
@@ -1243,14 +1233,6 @@ static int eqos_close(struct net_device *dev)
 
 	desc_if->free_buff_and_desc(pdata);
 	free_txrx_irqs(pdata);
-
-	/* Cancel hrtimer */
-	for (i = 0; i < pdata->num_chans; i++) {
-		if (atomic_read(&pdata->tx_queue[i].tx_usecs_timer_armed)
-				== EQOS_HRTIMER_ENABLE) {
-			hrtimer_cancel(&pdata->tx_queue[i].tx_usecs_timer);
-		}
-	}
 
 	pdata->hw_stopped = true;
 	mutex_unlock(&pdata->hw_change_lock);
@@ -1661,7 +1643,6 @@ static int eqos_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	INT retval = NETDEV_TX_OK;
 	int cnt = 0;
 	int tso;
-	unsigned long timer_val;
 
 	pr_debug("-->eqos_start_xmit: skb->len = %d, qinx = %u\n", skb->len, qinx);
 
@@ -1760,22 +1741,18 @@ static int eqos_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	/* configure required descriptor fields for transmission */
 	hw_if->pre_xmit(pdata, qinx);
 
-	/* Stop the queue if there might not be enough descriptors for another
-	 * packet.
-	 */
-	if (eqos_tx_avail(ptx_ring) <= EQOS_TX_DESC_THRESHOLD) {
+	if (ptx_ring->dirty_tx == ptx_ring->cur_tx) {
+		ptx_ring->tx_full = true;
+		napi_schedule(&pdata->tx_queue[qinx].napi);
 		netif_stop_subqueue(dev, qinx);
-		netdev_dbg(dev, "%s(): Stopping TX ring %d\n", __func__, qinx);
 	}
 
-	if (ptx_ring->use_tx_usecs == EQOS_COAELSCING_ENABLE &&
-	    atomic_read(&pdata->tx_queue[qinx].tx_usecs_timer_armed) ==
-	    EQOS_HRTIMER_DISABLE) {
-		atomic_set(&pdata->tx_queue[qinx].tx_usecs_timer_armed,
-			   EQOS_COAELSCING_ENABLE);
-		timer_val = ptx_ring->tx_usecs * NSEC_PER_USEC;
-		hrtimer_start(&pdata->tx_queue[qinx].tx_usecs_timer,
-			      (ktime_set(0, timer_val)), HRTIMER_MODE_REL);
+	/* Stop the queue if there might not be enough descriptors for another
+	 * packet (1 context desc + 1 header desc + fragment descs).
+	 */
+	if (eqos_tx_avail(ptx_ring) < MAX_SKB_FRAGS + 2) {
+		netif_stop_subqueue(dev, qinx);
+		netdev_dbg(dev, "%s(): Stopping TX ring %d\n", __func__, qinx);
 	}
 
 tx_netdev_return:
@@ -2040,6 +2017,7 @@ static int process_tx_completions(struct eqos_tx_queue *tx_queue, int budget)
 
 	pdata->xstats.tx_clean_n[qinx]++;
 	while (entry != ptx_ring->cur_tx && processed < budget) {
+cleanup:
 		ptx_desc = GET_TX_DESC_PTR(qinx, entry);
 		ptx_swcx_desc = GET_TX_BUF_PTR(qinx, entry);
 		tstamp_taken = 0;
@@ -2119,7 +2097,6 @@ static int process_tx_completions(struct eqos_tx_queue *tx_queue, int budget)
 			pdata->xstats.q_tx_pkt_n[qinx]++;
 			pdata->xstats.tx_pkt_n++;
 			dev->stats.tx_packets++;
-			processed++;
 		}
 
 		/* CTXT descriptors set their len to -1, which is an unsigned
@@ -2147,8 +2124,16 @@ static int process_tx_completions(struct eqos_tx_queue *tx_queue, int budget)
 	__netif_tx_lock(txq, smp_processor_id());
 	/* Update the dirty pointer and wake up the TX queue, if necessary. */
 	ptx_ring->dirty_tx = entry;
+
+	if ((ptx_ring->dirty_tx == ptx_ring->cur_tx) &&
+	    ptx_ring->tx_full) {
+		ptx_ring->tx_full = false;
+		__netif_tx_unlock(txq);
+		goto cleanup;
+	}
+
 	if (netif_tx_queue_stopped(txq) &&
-	    eqos_tx_avail(ptx_ring) > EQOS_TX_DESC_THRESHOLD) {
+	    eqos_tx_avail(ptx_ring) >= MAX_SKB_FRAGS + 2) {
 		netif_tx_wake_queue(txq);
 	}
 
@@ -2363,7 +2348,6 @@ static int process_rx_completions(struct eqos_rx_queue *rx_queue, int quota)
 			eqos_receive_skb(pdata, dev, skb, qinx);
 		} else {
 			eqos_update_rx_errors(dev, status);
-			dev_kfree_skb_any(prx_swcx_desc->skb);
 		}
 
 		received++;
@@ -2417,34 +2401,15 @@ int eqos_napi_poll_rx(struct napi_struct *napi, int budget)
 	return received;
 }
 
-static inline int eqos_txring_empty(struct tx_ring *ptx_ring)
-{
-	return (ptx_ring->dirty_tx == ptx_ring->cur_tx);
-}
-
 int eqos_napi_poll_tx(struct napi_struct *napi, int budget)
 {
 	struct eqos_tx_queue *tx_queue =
 	    container_of(napi, struct eqos_tx_queue, napi);
 	struct eqos_prv_data *pdata = tx_queue->pdata;
 	int qinx = tx_queue->chan_num;
-	struct tx_ring *ptx_ring = GET_TX_WRAPPER_DESC(qinx);
 	int processed;
-	unsigned long timer_val;
 
 	processed = process_tx_completions(tx_queue, budget);
-	/* re-arm the timer if tx ring is not empty */
-	if ((!eqos_txring_empty(ptx_ring)) &&
-	    (ptx_ring->use_tx_usecs == EQOS_COAELSCING_ENABLE) &&
-	     (atomic_read(&tx_queue->tx_usecs_timer_armed) ==
-	     EQOS_HRTIMER_DISABLE)) {
-		timer_val = ptx_ring->tx_usecs * NSEC_PER_USEC;
-		atomic_set(&tx_queue->tx_usecs_timer_armed,
-			   EQOS_HRTIMER_ENABLE);
-		hrtimer_start(&pdata->tx_queue[qinx].tx_usecs_timer,
-			      (ktime_set(0, timer_val)), HRTIMER_MODE_REL);
-	}
-
 	if (processed < budget) {
 		napi_complete(napi);
 		eqos_enable_chan_tx_interrupt(pdata, qinx);
@@ -3005,7 +2970,11 @@ int eqos_config_mac_loopback_mode(struct net_device *dev,
 
 static VOID eqos_config_timer_registers(struct eqos_prv_data *pdata)
 {
+#if KERNEL_VERSION(5, 4, 0) > LINUX_VERSION_CODE
 	struct timespec now;
+#else
+	struct timespec64 now;
+#endif
 	struct hw_if_struct *hw_if = &(pdata->hw_if);
 	u64 temp;
 
@@ -3033,7 +3002,11 @@ static VOID eqos_config_timer_registers(struct eqos_prv_data *pdata)
 	hw_if->config_addend(pdata->default_addend);
 
 	/* initialize system time */
+#if KERNEL_VERSION(5, 4, 0) > LINUX_VERSION_CODE
 	getnstimeofday(&now);
+#else
+	ktime_get_ts64(&now);
+#endif
 	hw_if->init_systime(now.tv_sec, now.tv_nsec);
 
 	pr_debug("-->eqos_config_timer_registers\n");
@@ -3558,7 +3531,11 @@ static int eqos_handle_hwtstamp_ioctl(struct eqos_prv_data *pdata,
 	u32 av_8021asm_en = 0;
 	u32 mac_tcr = 0;
 	u64 temp = 0;
+#if KERNEL_VERSION(5, 4, 0) > LINUX_VERSION_CODE
 	struct timespec now;
+#else
+	struct timespec64 now;
+#endif
 
 	DBGPR_PTP("-->eqos_handle_hwtstamp_ioctl\n");
 
@@ -3752,7 +3729,11 @@ static int eqos_handle_hwtstamp_ioctl(struct eqos_prv_data *pdata,
 		hw_if->config_addend(pdata->default_addend);
 
 		/* initialize system time */
+#if KERNEL_VERSION(5, 4, 0) > LINUX_VERSION_CODE
 		getnstimeofday(&now);
+#else
+		ktime_get_ts64(&now);
+#endif
 		hw_if->init_systime(now.tv_sec, now.tv_nsec);
 
 		DBGPR_PTP("-->eqos registering get_ptp function\n");
@@ -5147,16 +5128,13 @@ void eqos_init_rx_coalesce(struct eqos_prv_data *pdata)
 
 	pr_debug("-->eqos_init_rx_coalesce\n");
 
-	/* If RX coalescing parameters are not set in DT, set to default */
 	for (i = 0; i < EQOS_RX_QUEUE_CNT; i++) {
 		prx_ring = GET_RX_WRAPPER_DESC(i);
-		if (prx_ring->use_riwt == EQOS_COAELSCING_DISABLE) {
-			prx_ring->use_riwt = EQOS_COAELSCING_DISABLE;
-			prx_ring->rx_riwt =
-				eqos_usec2riwt(EQOS_OPTIMAL_DMA_RIWT_USEC,
-					       pdata);
-			prx_ring->rx_coal_frames = EQOS_RX_MAX_FRAMES;
-		}
+
+		prx_ring->use_riwt = 1;
+		prx_ring->rx_coal_frames = EQOS_RX_MAX_FRAMES;
+		prx_ring->rx_riwt =
+		    eqos_usec2riwt(EQOS_OPTIMAL_DMA_RIWT_USEC, pdata);
 	}
 
 	pr_debug("<--eqos_init_rx_coalesce\n");
@@ -5254,7 +5232,7 @@ void eqos_mmc_read(struct eqos_mmc_counters *mmc)
 	    eqos_reg_read(MMC_RXBROADCASTPACKETS_G_OFFSET);
 	mmc->mmc_rx_multicastframe_g +=
 	    eqos_reg_read(MMC_RXMULTICASTPACKETS_G_OFFSET);
-	mmc->mmc_rx_crc_error += eqos_reg_read(MMC_RXCRCERROR_OFFSET);
+	mmc->mmc_rx_crc_errror += eqos_reg_read(MMC_RXCRCERROR_OFFSET);
 	mmc->mmc_rx_align_error += eqos_reg_read(MMC_RXALIGNMENTERROR_OFFSET);
 	mmc->mmc_rx_run_error += eqos_reg_read(MMC_RXRUNTERROR_OFFSET);
 	mmc->mmc_rx_jabber_error += eqos_reg_read(MMC_RXJABBERERROR_OFFSET);

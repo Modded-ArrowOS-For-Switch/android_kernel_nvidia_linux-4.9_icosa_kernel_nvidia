@@ -1,7 +1,7 @@
 /*
  * eqos_ape_ioctl.c -- EQOS APE Clock Synchronization driver IO control
  *
- * Copyright (c) 2015-2021 NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2015-2020 NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -21,7 +21,6 @@
 #include <linux/slab.h>
 #include <linux/io.h>
 #include <linux/pm_runtime.h>
-#include <linux/tegra_pm_domains.h>
 #include <linux/clk/tegra.h>
 #include <linux/uaccess.h>
 #include <linux/cdev.h>
@@ -155,7 +154,7 @@ unsigned int cmd, unsigned long arg)
 		break;
 	case EQOS_APE_TEST_FREQ_ADJ:
 
-		if (!arg || copy_from_user(&eqos_ape,
+		if (arg && copy_from_user(&eqos_ape,
 			_eqos_ape,
 			sizeof(eqos_ape)))
 			return -EFAULT;
@@ -340,7 +339,7 @@ static int eqos_ape_probe(struct platform_device *pdev)
 			ret = -EINVAL;
 			goto out;
 		}
-		base = devm_ioremap_nocache(dev,
+		base = devm_ioremap(dev,
 				res->start,
 				resource_size(res));
 		if (IS_ERR_OR_NULL(base)) {

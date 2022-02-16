@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * drivers/misc/mods/mods.h - This file is part of NVIDIA MODS kernel driver.
+ * mods_internal.h - This file is part of NVIDIA MODS kernel driver.
  *
  * Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
  *

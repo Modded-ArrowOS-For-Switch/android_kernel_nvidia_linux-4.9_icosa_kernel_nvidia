@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017-2019, NVIDIA Corporation.  All rights reserved.
+ * Copyright (c) 2017-2018, NVIDIA Corporation.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -40,11 +40,17 @@ static int get_grouped_device(struct camrtc_device_group *grp,
 	if (np == NULL)
 		return 0;
 
+	if (!of_device_is_available(np)) {
+		dev_info(dev, "%s[%u] is disabled\n", name, index);
+		of_node_put(np);
+		return 0;
+	}
+
 	pdev = of_find_device_by_node(np);
 	of_node_put(np);
 
 	if (pdev == NULL) {
-		dev_info(dev, "%s[%u] node has no device\n", name, index);
+		dev_WARN(dev, "%s[%u] node has no device\n", name, index);
 		return 0;
 	}
 

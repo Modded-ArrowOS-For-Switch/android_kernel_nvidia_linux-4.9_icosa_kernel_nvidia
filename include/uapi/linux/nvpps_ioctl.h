@@ -1,5 +1,5 @@
 /*
- * include/uapi/linux/nvhvivc_mempool_ioctl.h
+ * include/uapi/linux/nvpps_ioctl.h
  *
  * Copyright (c) 2018-2020, NVIDIA CORPORATION. All rights reserved.
  *
@@ -20,7 +20,6 @@
 #include <linux/types.h>
 #include <linux/ioctl.h>
 
-
 struct nvpps_version {
 	struct _version {
 		__u32	major;
@@ -33,9 +32,13 @@ struct nvpps_version {
 };
 
 #define NVPPS_VERSION_MAJOR	0
-#define NVPPS_VERSION_MINOR	1
+#define NVPPS_VERSION_MINOR	2
 #define NVPPS_API_MAJOR		0
-#define NVPPS_API_MINOR		1
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
+#define NVPPS_API_MINOR		2
+#else
+#define NVPPS_API_MINOR         3
+#endif
 
 struct nvpps_params {
 	__u32	evt_mode;
@@ -63,9 +66,24 @@ struct nvpps_timeevent {
 };
 
 
+
+struct nvpps_timestamp_struct {
+	clockid_t	clockid;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
+	struct timespec	kernel_ts;
+	struct timespec	hw_ptp_ts;
+#else
+	struct timespec64 kernel_ts;
+        struct timespec64 hw_ptp_ts;
+#endif
+	__u64		extra[2];
+};
+
+
 #define NVPPS_GETVERSION	_IOR('p', 0x1, struct nvpps_version *)
 #define NVPPS_GETPARAMS		_IOR('p', 0x2, struct nvpps_params *)
 #define NVPPS_SETPARAMS		_IOW('p', 0x3, struct nvpps_params *)
 #define NVPPS_GETEVENT		_IOR('p', 0x4, struct nvpps_timeevent *)
+#define NVPPS_GETTIMESTAMP	_IOWR('p', 0x5, struct nvpps_timestamp_struct *)
 
 #endif /* __UAPI_NVPPS_IOCTL_H__ */

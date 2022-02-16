@@ -1,7 +1,7 @@
 /*
  * Tegra Graphics Host Virtual Memory Management
  *
- * Copyright (c) 2015-2017, NVIDIA Corporation. All rights reserved.
+ * Copyright (c) 2015-2020, NVIDIA Corporation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -19,22 +19,20 @@
 #include <linux/iommu.h>
 #include <linux/sizes.h>
 
-#include <linux/platform/tegra/tegra-mc-sid.h>
-
 #include "nvhost_vm.h"
 #include "iommu_context_dev.h"
 
 /* 5 second timeout */
 #define NVHOST_VM_WAIT_TIMEOUT (5000)
 
-static int host1x_vm_init(struct nvhost_vm *vm, void *identifier)
+static int host1x_vm_init(struct nvhost_vm *vm, void *identifier, struct device *dev)
 {
 	struct platform_device *pdev;
 	unsigned int i = 0;
 
 	/* wait until we have a context device */
 	do {
-		pdev = iommu_context_dev_allocate(identifier);
+		pdev = iommu_context_dev_allocate(identifier, dev);
 		if (!pdev) {
 			++i;
 			mdelay(1);
@@ -53,18 +51,12 @@ static int host1x_vm_init(struct nvhost_vm *vm, void *identifier)
 
 static u32 host1x_vm_get_id_dev(struct platform_device *pdev)
 {
-	/* default to physical StreamID */
-	int streamid = tegra_mc_get_smmu_bypass_sid();
+	const int streamid = nvhost_vm_get_hwid(pdev, 0);
 
-	/* If SMMU is available for this device, query sid */
-	if (pdev->dev.archdata.iommu) {
-		streamid = iommu_get_hwid(pdev->dev.archdata.iommu,
-					  &pdev->dev, 0);
-		if (streamid < 0)
-			streamid = tegra_mc_get_smmu_bypass_sid();
-	}
+	if (streamid >= 0)
+		return streamid;
 
-	return streamid;
+	return nvhost_vm_get_bypass_hwid();
 }
 
 static int host1x_vm_get_id(struct nvhost_vm *vm)
@@ -118,17 +110,9 @@ static void host1x_vm_deinit(struct nvhost_vm *vm)
 	iommu_context_dev_release(vm->pdev);
 }
 
-static int host1x_vm_pin_static_buffer(struct platform_device *pdev,
-				       void *vaddr, dma_addr_t paddr,
-				       size_t size)
-{
-	return iommu_context_dev_map_static(vaddr, paddr, size);
-}
-
 static const struct nvhost_vm_ops host1x_vm_ops = {
 	.init = host1x_vm_init,
 	.deinit = host1x_vm_deinit,
-	.pin_static_buffer = host1x_vm_pin_static_buffer,
 	.get_id = host1x_vm_get_id,
 	.init_device = host1x_vm_init_device,
 };

@@ -5,7 +5,7 @@
  * Copyright (C) 1999-2015, Broadcom Corporation
  *
  * Portions contributed by Nvidia
- * Copyright (C) 2015-2020, NVIDIA Corporation. All rights reserved.
+ * Copyright (C) 2015-2021, NVIDIA Corporation. All rights reserved.
  *
  *      Unless you and Broadcom execute a separate written software license
  * agreement governing use of this software, this software is licensed to you
@@ -69,7 +69,6 @@
 #include <bcmutils.h>
 #include <bcmendian.h>
 #include <bcmdevs.h>
-#include <nv_logger.h>
 
 #include <proto/ethernet.h>
 #include <proto/bcmevent.h>
@@ -1671,9 +1670,8 @@ static int dhd_set_suspend(int value, dhd_pub_t *dhd)
 #ifdef CONFIG_BCMDHD_CUSTOM_SYSFS_TEGRA
 				tegra_sysfs_suspend();
 #endif
-				nvlogger_suspend_work();
 				/* Kernel suspended */
-				DHD_ERROR(("%s: force extra Suspend setting\n", __FUNCTION__));
+				DHD_ERROR(("%s: force extra Suspend setting \n", __FUNCTION__));
 
 #ifndef SUPPORT_PM2_ONLY
 				dhd_wl_ioctl_cmd(dhd, WLC_SET_PM, (char *)&power_mode,
@@ -1729,9 +1727,8 @@ if (bcmdhd_support_p2p_go_ps) {
 #ifdef CONFIG_BCMDHD_CUSTOM_SYSFS_TEGRA
 				tegra_sysfs_resume();
 #endif
-				nvlogger_resume_work();
 				/* Kernel resumed  */
-				DHD_ERROR(("%s: Remove extra suspend setting\n", __FUNCTION__));
+				DHD_ERROR(("%s: Remove extra suspend setting \n", __FUNCTION__));
 
 #ifndef SUPPORT_PM2_ONLY
 				power_mode = PM_FAST;
@@ -1903,6 +1900,7 @@ struct net_device * dhd_idx2net(void *pub, int ifidx)
 
 	if (!dhd_pub || ifidx < 0 || ifidx >= DHD_MAX_IFS)
 		return NULL;
+	speculation_barrier();
 	dhd_info = dhd_pub->info;
 	if (dhd_info && dhd_info->iflist[ifidx])
 		return dhd_info->iflist[ifidx]->net;
@@ -2708,6 +2706,9 @@ dhd_start_xmit(struct sk_buff *skb, struct net_device *net)
 			DHD_ERROR(("%s: skb_realloc_headroom failed\n",
 			           dhd_ifname(&dhd->pub, ifidx)));
 			ret = -ENOMEM;
+#ifdef CONFIG_BCMDHD_CUSTOM_SYSFS_TEGRA
+			TEGRA_SYSFS_HISTOGRAM_STAT_INC(skb_realloc_headroom_fail);
+#endif
 			goto done;
 		}
 	}
@@ -3098,6 +3099,12 @@ dhd_rx_frame(dhd_pub_t *dhdp, int ifidx, void *pktbuf, int numpkt, uint8 chan)
 					DHD_ERROR(("ifidx:%d DHCP - REQUEST [RX]\n", ifidx));
 				} else if (dump_hex == 0x0105) {
 					DHD_ERROR(("ifidx:%d DHCP - ACK [RX]\n", ifidx));
+#ifdef CONFIG_BCMDHD_CUSTOM_NET_BW_EST_TEGRA
+					/* activate bw_estimator since DHCP is completed
+					 * the actual bw can never be one. So using value 1 as flag
+					 */
+					bcmdhd_stat.driver_stat.cur_bw_est = 1;
+#endif /* CONFIG_BCMDHD_CUSTOM_NET_BW_EST_TEGRA */
 				} else {
 					DHD_ERROR(("ifidx:%d DHCP - 0x%X [RX]\n", dump_hex, ifidx));
 				}
@@ -3824,7 +3831,7 @@ dhd_ethtool(dhd_info_t *dhd, void *uaddr)
 		/* Copy out any request driver name */
 		if (copy_from_user(&info, uaddr, sizeof(info)))
 			return -EFAULT;
-		strncpy(drvname, info.driver, sizeof(drvname));
+		strncpy(drvname, info.driver, sizeof(info.driver));
 		drvname[sizeof(info.driver)-1] = '\0';
 
 		/* clear struct for return */
@@ -4372,7 +4379,7 @@ dhd_open(struct net_device *net)
 		ret = -1;
 		goto exit;
 	}
-
+	speculation_barrier();
 	if (!dhd->iflist[ifidx]) {
 		DHD_ERROR(("%s: Error: called when IF already deleted\n", __FUNCTION__));
 		ret = -1;
@@ -4657,7 +4664,8 @@ dhd_allocate_if(dhd_pub_t *dhdpub, int ifidx, char *name,
 	dhd_dev_priv_save(ifp->net, dhdinfo, ifp, ifidx);
 
 	if (name && name[0]) {
-		strlcpy(ifp->net->name, name, IFNAMSIZ);
+		strncpy(ifp->net->name, name, IFNAMSIZ);
+		ifp->net->name[IFNAMSIZ - 1] = '\0';
 	}
 #ifdef WL_CFG80211
 	if (ifidx == 0)
@@ -4735,10 +4743,8 @@ dhd_remove_if(dhd_pub_t *dhdpub, int ifidx, bool need_rtnl_lock)
 				custom_rps_map_clear(ifp->net->_rx);
 #endif /* SET_RPS_CPUS */
 #ifdef CONFIG_BCMDHD_CUSTOM_SYSFS_TEGRA
-				if (ifidx == 0) {
+				if (ifidx == 0)
 					tegra_sysfs_unregister(&ifp->net->dev);
-					dhdlog_sysfs_deinit(&ifp->net->dev);
-				}
 #endif
 				if (need_rtnl_lock)
 					unregister_netdev(ifp->net);
@@ -5231,7 +5237,6 @@ dhd_attach(osl_t *osh, struct dhd_bus *bus, uint bus_hdrlen)
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 25))
 	mutex_init(&dhd->dhd_net_if_mutex);
 	mutex_init(&dhd->dhd_suspend_mutex);
-	write_log_init();
 #endif
 	dhd_state |= DHD_ATTACH_STATE_WAKELOCKS_INIT;
 
@@ -6291,11 +6296,10 @@ dhd_preinit_ioctls(dhd_pub_t *dhd)
 
 #if defined(ROAM_ENABLE) || defined(DISABLE_BUILTIN_ROAM)
 	/* Disable built-in roaming to allowed ext supplicant to take care of roaming */
-        if (builtin_roam_disabled)
-		roamvar  = 1;
-
-	dhd_iovar(dhd, 0, "roam_off", (char *)&roamvar, sizeof(roamvar),
-		  NULL, 0, TRUE);
+	if (builtin_roam_disabled) {
+		dhd_iovar(dhd, 0, "roam_off", (char *)&roamvar, sizeof(roamvar),
+			  NULL, 0, TRUE);
+	}
 #endif /* ROAM_ENABLE || DISABLE_BUILTIN_ROAM */
 #if defined(ROAM_ENABLE)
 	if (!builtin_roam_disabled) {
@@ -7297,7 +7301,6 @@ dhd_register_if(dhd_pub_t *dhdp, int ifidx, bool need_rtnl_lock)
 	if (ifidx == 0) {
 		dhd_custom_sysfs_tegra_histogram_stat_netdev = net;
 		tegra_sysfs_register(&net->dev);
-		dhdlog_sysfs_init(&net->dev);
 	}
 }
 #endif
@@ -7504,7 +7507,6 @@ void dhd_detach(dhd_pub_t *dhdp)
 		} else
 			tasklet_kill(&dhd->tasklet);
 	}
-	write_log_uninit();
 #ifdef WL_CFG80211
 	if (dhd->dhd_state & DHD_ATTACH_STATE_CFG80211) {
 		wl_cfg80211_detach(NULL);
@@ -9971,7 +9973,7 @@ dhd_wmf_t* dhd_wmf_conf(dhd_pub_t *dhdp, uint32 idx)
 #define TEMP_FRAME_SIZE 300
 int
 dhd_dev_start_mkeep_alive(dhd_pub_t *dhd_pub, u8 mkeep_alive_id, u8 *ip_pkt, u16 ip_pkt_len,
-	u8* src_mac, u8* dst_mac, u32 period_msec)
+	u8* src_mac, u8* dst_mac, u32 period_msec, u16 ether_type)
 {
 	char *pbuf;
 	const char *str;
@@ -10049,7 +10051,8 @@ dhd_dev_start_mkeep_alive(dhd_pub_t *dhd_pub, u8 mkeep_alive_id, u8 *ip_pkt, u16
 	memset(pbuf, 0, TEMP_BUF_SIZE);
 	str = "mkeep_alive";
 	str_len = strlen(str);
-	strlcpy(pbuf, str, TEMP_BUF_SIZE);
+	strncpy(pbuf, str, str_len);
+	pbuf[str_len] = '\0';
 
 	mkeep_alive_pktp = (wl_mkeep_alive_pkt_t *) (pbuf + str_len + 1);
 	mkeep_alive_pkt.period_msec = htod32(period_msec);
@@ -10074,9 +10077,15 @@ dhd_dev_start_mkeep_alive(dhd_pub_t *dhd_pub, u8 mkeep_alive_id, u8 *ip_pkt, u16
 	memcpy(pmac_frame, src_mac, ETHER_ADDR_LEN);
 	pmac_frame += ETHER_ADDR_LEN;
 
-	/* Mapping Ethernet type (ETHERTYPE_IP: 0x0800) */
-	*(pmac_frame++) = 0x08;
-	*(pmac_frame++) = 0x00;
+	if (ether_type == 0) {
+		/* Mapping Ethernet type (ETHERTYPE_IP: 0x0800) */
+		*(pmac_frame++) = 0x08;
+		*(pmac_frame++) = 0x00;
+	} else {
+		*(pmac_frame) = ether_type;
+		/* 2 Octets to be moved */
+		pmac_frame += 2;
+	}
 
 	/* Mapping IP pkt */
 	memcpy(pmac_frame, ip_pkt, ip_pkt_len);
@@ -10168,7 +10177,8 @@ dhd_dev_stop_mkeep_alive(dhd_pub_t *dhd_pub, u8 mkeep_alive_id)
 		memset(pbuf, 0, TEMP_BUF_SIZE);
 		str = "mkeep_alive";
 		str_len = strlen(str);
-		strlcpy(pbuf, str, str_len + 1);
+		strncpy(pbuf, str, str_len);
+		pbuf[str_len] = '\0';
 
 		mkeep_alive_pktp = (wl_mkeep_alive_pkt_t *) (pbuf + str_len + 1);
 

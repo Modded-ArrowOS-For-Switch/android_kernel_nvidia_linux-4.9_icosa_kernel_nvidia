@@ -1,9 +1,9 @@
 /*
- * drivers/video/tegra/host/t186/hardware_t124.h
+ * drivers/video/tegra/host/t186/hardware_t186.h
  *
  * Tegra T186 HOST1X Register Definitions
  *
- * Copyright (c) 2014-2015, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2014-2020, NVIDIA CORPORATION.  All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -165,6 +165,18 @@ static inline u32 nvhost_opcode_setstreamid(unsigned streamid)
 static inline u32 nvhost_opcode_setpayload(unsigned payload)
 {
 	return (9 << 28) | payload;
+}
+
+static inline u32 nvhost_opcode_incr_w(unsigned int offset)
+{
+	/* 20-bit offset supported */
+	return (10 << 28) | offset;
+}
+
+static inline u32 nvhost_opcode_nonincr_w(unsigned int offset)
+{
+	/* 20-bit offset supported */
+	return (11 << 28) | offset;
 }
 
 static inline u32 nvhost_opcode_acquire_mlock(unsigned id)

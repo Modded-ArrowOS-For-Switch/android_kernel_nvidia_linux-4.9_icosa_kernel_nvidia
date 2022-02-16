@@ -29,8 +29,13 @@
 #include <linux/clk/tegra.h>
 #include <linux/syscore_ops.h>
 #include <linux/platform/tegra/common.h>
+#include <linux/version.h>
+#if KERNEL_VERSION(4, 15, 0) > LINUX_VERSION_CODE
 #include <soc/tegra/fuse.h>
 #include <soc/tegra/chip-id.h>
+#else
+#include <soc/tegra/fuse.h>
+#endif
 #include <asm/bug.h>
 #include <asm/io.h>
 #include <asm/string.h>
@@ -500,7 +505,7 @@ static int display_bw_mbps_set(void *data, u64 val)
 
 static int display_set_la_ptsa_set(void *data, u64 val)
 {
-	struct dc_to_la_params disp_params = {0};
+	struct dc_to_la_params disp_params;
 
 	if (cs.set_disp_la(ID(NVDISPLAYR),
 				debugfs_display_emc_freq_hz,

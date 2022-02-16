@@ -213,6 +213,7 @@ static int nvdla_pin(struct nvdla_private *priv, void *arg)
 			goto fail_to_get_dma_buf;
 		}
 	}
+	speculation_barrier(); /* break_spec_p#5_1 */
 
 	err = nvdla_buffer_pin(priv->buffers, dmabufs, count);
 
@@ -272,6 +273,7 @@ static int nvdla_unpin(struct nvdla_private *priv, void *arg)
 		if (IS_ERR_OR_NULL(dmabufs[i]))
 			continue;
 	}
+	speculation_barrier(); /* break_spec_p#5_1 */
 
 	nvdla_buffer_unpin(priv->buffers, dmabufs, count);
 
@@ -466,7 +468,7 @@ static int nvdla_send_emu_signal_fences(struct nvdla_emu_task *task,
 				"%s_%d_%d_prefence", dev_name(&dla_pdev->dev),
 				task->prefences[i].syncpoint_index, i);
 
-			err = nvhost_sync_create_fence_fd(host_pdev,
+			err = nvhost_fence_create_fd(host_pdev,
 				&info, 1, fence_name,
 				&task->prefences[i].sync_fd);
 
@@ -477,6 +479,7 @@ static int nvdla_send_emu_signal_fences(struct nvdla_emu_task *task,
 			}
 		}
 	}
+	speculation_barrier(); /* break_spec_p#5_1 */
 
 	nvdla_dbg_fn(dla_pdev, "copy prefences to user");
 	/* send pre fences */
@@ -507,7 +510,7 @@ static int nvdla_send_emu_signal_fences(struct nvdla_emu_task *task,
 				"%s_%d_%d_postfence", dev_name(&dla_pdev->dev),
 				task->postfences[i].syncpoint_index, i);
 
-			err = nvhost_sync_create_fence_fd(host_pdev,
+			err = nvhost_fence_create_fd(host_pdev,
 				&info, 1, fence_name,
 				&task->postfences[i].sync_fd);
 
@@ -518,6 +521,7 @@ static int nvdla_send_emu_signal_fences(struct nvdla_emu_task *task,
 			}
 		}
 	}
+	speculation_barrier(); /* break_spec_p#5_1 */
 
 	nvdla_dbg_fn(dla_pdev, "copy postfences to user");
 	/* send post fences */
@@ -568,7 +572,7 @@ static int nvdla_update_signal_fences(struct nvdla_task *task,
 				"%s_%d_%d_prefence", dev_name(&dla_pdev->dev),
 				task->prefences[i].syncpoint_index, i);
 
-			err = nvhost_sync_create_fence_fd(host_pdev,
+			err = nvhost_fence_create_fd(host_pdev,
 				&info, 1, fence_name,
 				&task->prefences[i].sync_fd);
 
@@ -579,6 +583,7 @@ static int nvdla_update_signal_fences(struct nvdla_task *task,
 			}
 		}
 	}
+	speculation_barrier(); /* break_spec_p#5_1 */
 
 	nvdla_dbg_fn(dla_pdev, "copy prefences to user");
 	/* copy pre fences */
@@ -609,7 +614,7 @@ static int nvdla_update_signal_fences(struct nvdla_task *task,
 				"%s_%d_%d_postfence", dev_name(&dla_pdev->dev),
 				task->postfences[i].syncpoint_index, i);
 
-			err = nvhost_sync_create_fence_fd(host_pdev,
+			err = nvhost_fence_create_fd(host_pdev,
 				&info, 1, fence_name,
 				&task->postfences[i].sync_fd);
 
@@ -620,6 +625,7 @@ static int nvdla_update_signal_fences(struct nvdla_task *task,
 			}
 		}
 	}
+	speculation_barrier(); /* break_spec_p#5_1 */
 
 	nvdla_dbg_fn(dla_pdev, "copy postfences to user");
 	/* copy post fences */
@@ -691,10 +697,10 @@ static int nvdla_val_task_submit_input(struct nvdla_ioctl_submit_task *in_task)
 				in_task->num_addresses);
 		return -EINVAL;
 	}
-	if (in_task->num_addresses > NVDLA_MAX_BUFFERS_PER_TASK) {
+	if (in_task->num_addresses > MAX_NVDLA_BUFFERS_PER_TASK) {
 		pr_err("num addresses[%u] crossing expected[%d]\n",
 			in_task->num_addresses,
-			NVDLA_MAX_BUFFERS_PER_TASK);
+			MAX_NVDLA_BUFFERS_PER_TASK);
 		return -EINVAL;
 	}
 
@@ -853,6 +859,7 @@ static void nvdla_dump_task(struct nvdla_task *task)
 				i, task->memory_handles[i].handle,
 				task->memory_handles[i].offset);
 	}
+	speculation_barrier(); /* break_spec_p#5_1 */
 }
 
 static int nvdla_emu_task_submit(struct nvdla_private *priv, void *arg)
@@ -939,6 +946,7 @@ static int nvdla_emu_task_submit(struct nvdla_private *priv, void *arg)
 		}
 		nvdla_dbg_info(pdev, "signal fences of task[%d] sent", i + 1);
 	}
+	speculation_barrier(); /* break_spec_p#5_1 */
 	nvdla_dbg_fn(pdev, "Emulator task submitted, done!");
 
 exit:
@@ -1240,7 +1248,7 @@ static int nvdla_open(struct inode *inode, struct file *file)
 		if (clock->moduleid ==
 			NVHOST_MODULE_ID_EXTERNAL_MEMORY_CONTROLLER) {
 			err = nvhost_module_set_rate(pdev, priv, UINT_MAX,
-				index, clock->bwmgr_request_type);
+				index, clock->request_type);
 			if (err < 0)
 				goto err_set_emc_rate;
 			break;

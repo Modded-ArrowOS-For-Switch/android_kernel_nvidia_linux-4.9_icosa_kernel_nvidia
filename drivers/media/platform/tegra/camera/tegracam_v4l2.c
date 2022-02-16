@@ -17,6 +17,7 @@
  */
 #include <linux/types.h>
 #include <linux/module.h>
+#include <linux/version.h>
 #include <media/tegra-v4l2-camera.h>
 #include <media/tegracam_core.h>
 #include <media/tegracam_utils.h>
@@ -38,7 +39,7 @@ static int v4l2sd_stream(struct v4l2_subdev *sd, int enable)
 	memset(ctrl_blob, 0, sizeof(struct sensor_blob));
 	memset(mode_blob, 0, sizeof(struct sensor_blob));
 	if (enable) {
-		/* increase ref count so module can't be unloaded while streaming */
+		/* increase ref count so module can't be unloaded */
 		if (!try_module_get(s_data->owner))
 			return -ENODEV;
 
@@ -109,7 +110,9 @@ static int v4l2sd_g_input_status(struct v4l2_subdev *sd, u32 *status)
 
 static struct v4l2_subdev_video_ops v4l2sd_video_ops = {
 	.s_stream	= v4l2sd_stream,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 	.g_mbus_config	= camera_common_g_mbus_config,
+#endif
 	.g_input_status = v4l2sd_g_input_status,
 };
 
@@ -159,6 +162,9 @@ static struct v4l2_subdev_pad_ops v4l2sd_pad_ops = {
 	.enum_mbus_code = camera_common_enum_mbus_code,
 	.enum_frame_size	= camera_common_enum_framesizes,
 	.enum_frame_interval	= camera_common_enum_frameintervals,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+	.get_mbus_config	= camera_common_get_mbus_config,
+#endif
 };
 
 static struct v4l2_subdev_ops v4l2sd_ops = {

@@ -3,7 +3,7 @@
  *
  * Tegra Graphics Host VI
  *
- * Copyright (c) 2012-2018, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2012-2020, NVIDIA CORPORATION. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms and conditions of the GNU General Public License,
@@ -27,8 +27,17 @@
 #include <linux/of_device.h>
 #include <linux/of_platform.h>
 #include <linux/clk/tegra.h>
+#include <linux/version.h>
+#if KERNEL_VERSION(4, 15, 0) > LINUX_VERSION_CODE
 #include <soc/tegra/chip-id.h>
+#else
+#include <soc/tegra/fuse.h>
+#endif
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
 #include <linux/tegra_pm_domains.h>
+#else
+#include <linux/pm_domain.h>
+#endif
 #include <linux/debugfs.h>
 #include <linux/slab.h>
 
@@ -535,7 +544,11 @@ static int __exit vi_remove(struct platform_device *dev)
 #endif
 
 #ifdef CONFIG_PM_GENERIC_DOMAINS
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
 	tegra_pd_remove_device(&dev->dev);
+#else
+	pm_genpd_remove_device(&dev->dev);
+#endif
 #endif
 
 	regulator_put(tegra_vi->reg);

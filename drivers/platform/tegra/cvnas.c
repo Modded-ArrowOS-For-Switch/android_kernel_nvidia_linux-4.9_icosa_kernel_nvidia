@@ -1,7 +1,7 @@
 /*
  * drivers/platform/tegra/cvnas.c
  *
- * Copyright (C) 2017-2018, NVIDIA Corporation.  All rights reserved.
+ * Copyright (C) 2017-2021, NVIDIA Corporation.  All rights reserved.
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -35,12 +35,19 @@
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 #include <linux/nvmap_t19x.h>
+#include <linux/version.h>
+#if KERNEL_VERSION(4, 15, 0) > LINUX_VERSION_CODE
 #include <soc/tegra/chip-id.h>
+#endif
 #include <soc/tegra/fuse.h>
 #include <linux/clk-provider.h>
 
 static int cvnas_debug;
 module_param(cvnas_debug, int, 0644);
+#define CVNOC_MISC_DBG_APERTURE_CONTROL 0x8
+#define CVNOC_MISC_DBG_APERTURE_DISABLE 0x1
+
+static bool cvnas_rail;
 
 #define CVSRAM_MEM_INIT_OFFSET		0x00
 #define CVSRAM_MEM_INIT_START		BIT(0)
@@ -114,6 +121,31 @@ static u32 nvhsm_readl(struct cvnas_device *dev, u32 reg)
 {
 	return readl(dev->hsm_iobase + reg);
 }
+
+/* Call at the time we allocate something from CVNAS */
+int nvcvnas_busy(void)
+{
+	if (!cvnas_plat_dev) {
+		pr_err("CVNAS Platform Device not found\n");
+		return -ENODEV;
+	}
+
+	return pm_runtime_get_sync(&cvnas_plat_dev->dev);
+}
+EXPORT_SYMBOL(nvcvnas_busy);
+
+/* Call after we release a buffer */
+int nvcvnas_idle(void)
+{
+	if (!cvnas_plat_dev) {
+		pr_err("CVNAS Platform Device not found\n");
+		return -ENODEV;
+	}
+
+	return pm_runtime_put(&cvnas_plat_dev->dev);
+}
+EXPORT_SYMBOL(nvcvnas_idle);
+
 
 static int cvsram_perf_counters_show(struct seq_file *s, void *data)
 {
@@ -223,6 +255,30 @@ static const struct file_operations cvsram_ecc_err_fops = {
 	.release = single_release,
 };
 
+static int rd_cvrail(void *data, u64 *val)
+{
+	*val = cvnas_rail;
+	return 0;
+}
+
+static int wr_cvrail(void *data, u64 val)
+{
+	bool cvrail = (bool)val;
+	int ret = 0;
+
+	if (cvrail) {
+		ret = nvcvnas_busy();
+		cvnas_rail = true;
+	} else {
+		ret = nvcvnas_idle();
+		cvnas_rail = false;
+	}
+
+	return ret;
+}
+DEFINE_SIMPLE_ATTRIBUTE(cvnas_reg_fops, rd_cvrail, wr_cvrail,
+	"%llu\n");
+
 static int nvcvnas_debugfs_init(struct cvnas_device *dev)
 {
 	struct dentry *root;
@@ -231,6 +287,8 @@ static int nvcvnas_debugfs_init(struct cvnas_device *dev)
 	if (!root)
 		return PTR_ERR(root);
 
+	debugfs_create_file("cvrail", 0644,
+		 root, dev, &cvnas_reg_fops);
 	debugfs_create_x64("cvsram_base", S_IRUGO, root, &dev->cvsram_base);
 	debugfs_create_size_t("cvsram_size", S_IRUGO, root, &dev->cvsram_size);
 	debugfs_create_file("cvsram_perf_counters", S_IRUGO, root, dev, &cvsram_perf_fops);
@@ -271,6 +329,16 @@ static int nvcvsram_ecc_setup(struct cvnas_device *dev)
 	if (mem_init & CVSRAM_MEM_INIT_STATUS)
 		return 0;
 	return -EBUSY;
+}
+
+/* Disable CVNOC Debug Aperture */
+static void disable_cvnoc_debug_apert(struct cvnas_device *cvnas_dev)
+{
+	unsigned long val;
+
+	val = readl(cvnas_dev->cvreg_iobase + CVNOC_MISC_DBG_APERTURE_CONTROL);
+	val = val | CVNOC_MISC_DBG_APERTURE_DISABLE;
+	writel(val, cvnas_dev->cvreg_iobase + CVNOC_MISC_DBG_APERTURE_CONTROL);
 }
 
 static int nvcvnas_power_on(struct cvnas_device *cvnas_dev)
@@ -319,6 +387,10 @@ static int nvcvnas_power_on(struct cvnas_device *cvnas_dev)
 		pr_err("ECC init failed\n");
 		goto err_init_ecc;
 	}
+
+
+	if (!tegra_platform_is_sim())
+		disable_cvnoc_debug_apert(cvnas_dev);
 
 	return 0;
 
@@ -369,42 +441,26 @@ static int nvcvnas_power_off(struct cvnas_device *cvnas_dev)
 	return 0;
 }
 
-/* Call at the time we allocate something from CVNAS */
-int nvcvnas_busy(void)
-{
-	if (!cvnas_plat_dev) {
-		pr_err("CVNAS Platform Device not found\n");
-		return -ENODEV;
-	}
-
-	return pm_runtime_get_sync(&cvnas_plat_dev->dev);
-}
-EXPORT_SYMBOL(nvcvnas_busy);
-
-/* Call after we release a buffer */
-int nvcvnas_idle(void)
-{
-	if (!cvnas_plat_dev) {
-		pr_err("CVNAS Platform Device not found\n");
-		return -ENODEV;
-	}
-
-	return pm_runtime_put(&cvnas_plat_dev->dev);
-}
-EXPORT_SYMBOL(nvcvnas_idle);
-
 phys_addr_t nvcvnas_get_cvsram_base(void)
 {
-	struct cvnas_device *cvnas_dev = dev_get_drvdata(&cvnas_plat_dev->dev);
+	struct cvnas_device *cvnas_dev;
 
+	if (!cvnas_plat_dev)
+		return 0;
+
+	cvnas_dev = dev_get_drvdata(&cvnas_plat_dev->dev);
 	return cvnas_dev->cvsram_base;
 }
 EXPORT_SYMBOL(nvcvnas_get_cvsram_base);
 
 size_t nvcvnas_get_cvsram_size(void)
 {
-	struct cvnas_device *cvnas_dev = dev_get_drvdata(&cvnas_plat_dev->dev);
+	struct cvnas_device *cvnas_dev;
 
+	if (!cvnas_plat_dev)
+		return 0;
+
+	cvnas_dev = dev_get_drvdata(&cvnas_plat_dev->dev);
 	return cvnas_dev->cvsram_size;
 }
 EXPORT_SYMBOL(nvcvnas_get_cvsram_size);
@@ -437,6 +493,10 @@ static ssize_t clk_cap_store(struct device *dev,
 
 	ret = kstrtoul(buf, 0, &max_rate);
 	if (ret)
+		return -EINVAL;
+
+	max_rate = clk_round_rate(cvnas->clk, max_rate);
+	if (max_rate < 0)
 		return -EINVAL;
 
 	ret = clk_set_max_rate(cvnas->clk, max_rate);
@@ -473,7 +533,11 @@ static int nvcvnas_probe(struct platform_device *pdev)
 	u32 cvsram_reg_data[4];
 	const struct of_device_id *match;
 
+#if KERNEL_VERSION(4, 15, 0) > LINUX_VERSION_CODE
 	if (tegra_get_chipid() == TEGRA_CHIPID_TEGRA19 &&
+#else
+	if (tegra_get_chip_id() == TEGRA194 &&
+#endif
 		tegra_get_sku_id() == 0x9E) {
 		dev_err(&pdev->dev, "CVNAS IP is disabled in SKU.\n");
 		return -ENODEV;
